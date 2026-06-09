@@ -1,5 +1,16 @@
 import os
 import pickle
+import logging
+
+os.makedirs('output', exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s',
+    handlers=[
+        logging.FileHandler('output/training.log'),
+        logging.StreamHandler()
+    ]
+)
 import numpy as np
 import pandas as pd
 import duckdb
@@ -203,14 +214,14 @@ def build_multihot_features(con, table, id_col, val_col, valid_ids, top_k, trim=
     return feature_dict, len(vocab)
 
 def fetch_mimic3_data(embeddings_dict):
-    print("Connecting to DuckDB and loading MIMIC-III features...")
+    logging.info("Connecting to DuckDB and loading MIMIC-III features...")
     con = duckdb.connect()
     
     stay_ids = list(embeddings_dict.keys())
     if not stay_ids: return None, None, None, None, None, None
         
     # 1. Stays and Demographics
-    print("Loading Demographics...")
+    logging.info("Loading Demographics...")
     stays_df = con.query(f"""
         SELECT 
             s.SUBJECT_ID, s.HADM_ID, s.ICUSTAY_ID as stay_id, s.INTIME, s.OUTTIME,
@@ -241,30 +252,30 @@ def fetch_mimic3_data(embeddings_dict):
     hadm_ids_tuple = tuple(stays_df['HADM_ID'].unique().tolist())
 
     # 2. Extract High-Dim Sparse Features
-    print("Loading ICD Diagnoses (Top 64)...")
+    logging.info("Loading ICD Diagnoses (Top 64)...")
     icd_dict, icd_dim = build_multihot_features(con, 'DIAGNOSES_ICD', 'HADM_ID', 'ICD9_CODE', hadm_ids_tuple, top_k=64, trim=3)
     
-    print("Loading DRG Codes (Top 64)...")
+    logging.info("Loading DRG Codes (Top 64)...")
     drg_dict, drg_dim = build_multihot_features(con, 'DRGCODES', 'HADM_ID', 'DRG_CODE', hadm_ids_tuple, top_k=64)
     
-    print("Loading Procedures ICD (Top 64)...")
+    logging.info("Loading Procedures ICD (Top 64)...")
     proc_dict, proc_dim = build_multihot_features(con, 'PROCEDURES_ICD', 'HADM_ID', 'ICD9_CODE', hadm_ids_tuple, top_k=64, trim=3)
     
-    print("Loading Pharmacy / Prescriptions (Top 64)...")
+    logging.info("Loading Pharmacy / Prescriptions (Top 64)...")
     rx_dict, rx_dim = build_multihot_features(con, 'PRESCRIPTIONS', 'HADM_ID', 'DRUG', hadm_ids_tuple, top_k=64)
     
     multihot_dims = {'icd': icd_dim, 'drg': drg_dim, 'proc': proc_dim, 'rx': rx_dim}
 
     # 3. Dynamic Sequence Features
     item_map = {211: 0, 220045: 0, 618: 1, 220210: 1, 646: 2, 220277: 2, 51: 3, 220050: 3}
-    print(f"Querying CHARTEVENTS for sequences...")
+    logging.info(f"Querying CHARTEVENTS for sequences...")
     events_df = con.query(f"""
         SELECT ICUSTAY_ID as stay_id, CHARTTIME, ITEMID, VALUENUM
         FROM read_csv_auto('/home/hanwen/data/mimic/iii/CHARTEVENTS.csv', sample_size=-1)
         WHERE ICUSTAY_ID IN {tuple(stay_ids)} AND ITEMID IN {tuple(item_map.keys())} AND VALUENUM IS NOT NULL
     """).df()
     
-    print("Formatting dataset...")
+    logging.info("Formatting dataset...")
     X_seq, X_static, X_mh, X_note, Y = [], [], [], [], []
     
     for _, stay in stays_df.iterrows():
@@ -305,7 +316,7 @@ def flatten_features(X_seq, X_static, X_mh):
 
 def main():
     if not os.path.exists('output/mimic3_note_embeddings.pkl'):
-        print("Embeddings file not found! Please run preprocess_note_embeddings.py first.")
+        logging.error("Embeddings file not found! Please run preprocess_note_embeddings.py first.")
         return
         
     with open('output/mimic3_note_embeddings.pkl', 'rb') as f:
@@ -321,14 +332,14 @@ def main():
     ts = int(0.8 * len(Y))
     train_idx, test_idx = idx[:ts], idx[ts:]
     
-    print("\n================ ABLATION STUDY: CLINICAL ALIGNMENT ================")
+    logging.info("\n================ ABLATION STUDY: CLINICAL ALIGNMENT ================")
     
-    print("1. Training Base LSTM (Clinical Series + Demographics + ICD/DRG/Proc/Rx, NO Notes)...")
+    logging.info("1. Training Base LSTM (Clinical Series + Demographics + ICD/DRG/Proc/Rx, NO Notes)...")
     model_base = LSTMLateFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, use_notes=False)
     model_base = train_model(model_base, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx])
     auc_base = evaluate_model(model_base, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx])
     
-    print("2. Training Late Fusion LSTM (Base + LLM Notes Embedding)...")
+    logging.info("2. Training Late Fusion LSTM (Base + LLM Notes Embedding)...")
     model_notes = LSTMLateFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=4096, use_notes=True)
     model_notes = train_model(model_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx])
     auc_notes = evaluate_model(model_notes, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
@@ -343,13 +354,13 @@ def main():
     xgb_notes.fit(X_xgb_notes[train_idx], Y[train_idx])
     xgb_notes_auc = roc_auc_score(Y[test_idx], xgb_notes.predict_proba(X_xgb_notes[test_idx])[:, 1])
 
-    print("\n================ FINAL ABLATION RESULTS ================")
-    print(f"XGBoost Base (Clinical + Static + Sparse):     {xgb_base_auc:.4f}")
-    print(f"XGBoost + LLM Notes:                           {xgb_notes_auc:.4f}")
-    print("-" * 55)
-    print(f"LSTM Base (Clinical + Static + Sparse):        {auc_base:.4f}")
-    print(f"LSTM LateFusion (+ LLM Notes):                 {auc_notes:.4f}")
-    print("========================================================\n")
+    logging.info("\n================ FINAL ABLATION RESULTS ================")
+    logging.info(f"XGBoost Base (Clinical + Static + Sparse):     {xgb_base_auc:.4f}")
+    logging.info(f"XGBoost + LLM Notes:                           {xgb_notes_auc:.4f}")
+    logging.info("-" * 55)
+    logging.info(f"LSTM Base (Clinical + Static + Sparse):        {auc_base:.4f}")
+    logging.info(f"LSTM LateFusion (+ LLM Notes):                 {auc_notes:.4f}")
+    logging.info("========================================================\n")
 
 if __name__ == "__main__":
     main()
