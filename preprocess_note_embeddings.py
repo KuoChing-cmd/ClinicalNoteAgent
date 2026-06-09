@@ -5,8 +5,7 @@ import requests
 import pickle
 import os
 import re
-import re
-import re
+import argparse
 import concurrent.futures
 from tqdm import tqdm
 
@@ -53,15 +52,17 @@ def embed_text(text):
         print(f"Embed error: {e}")
     return np.zeros(4096, dtype=np.float32)
 
-def main():
+def main(limit=None):
     print("🚀 Using DuckDB to load MIMIC-III cohort...")
     con = duckdb.connect()
     
     # We select a manageable cohort of 200 stays for demonstration
-    stays_df = con.query("""
+    limit_clause = f"LIMIT {limit}" if limit else ""
+    stays_df = con.query(f"""
         SELECT SUBJECT_ID, HADM_ID, ICUSTAY_ID as stay_id, INTIME, OUTTIME
         FROM read_csv_auto('/home/hanwen/data/mimic/iii/ICUSTAYS.csv', sample_size=-1)
         WHERE HADM_ID IS NOT NULL
+        {limit_clause}
     """).df()
     
     hadm_ids = tuple(stays_df['HADM_ID'].dropna().unique().astype(int).tolist())
@@ -129,4 +130,7 @@ def main():
     print(f"✅ Successfully saved {len(embeddings_dict)} embeddings to {output_file}")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Preprocess MIMIC-III note embeddings")
+    parser.add_argument("--limit", type=int, default=None, help="Limit the number of cases to process")
+    args = parser.parse_args()
+    main(limit=args.limit)
