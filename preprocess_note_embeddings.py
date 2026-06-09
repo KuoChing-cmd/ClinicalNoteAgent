@@ -80,7 +80,18 @@ def main(limit=None):
     notes_df['CHARTTIME'] = pd.to_datetime(notes_df['CHARTTIME'], errors='coerce')
     notes_df['CHARTDATE'] = pd.to_datetime(notes_df['CHARTDATE'], errors='coerce')
     
+    output_file = 'output/mimic3_note_embeddings.pkl'
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    
     embeddings_dict = {}
+    if os.path.exists(output_file):
+        print(f"Loading existing embeddings from {output_file}...")
+        try:
+            with open(output_file, 'rb') as f:
+                embeddings_dict = pickle.load(f)
+        except Exception as e:
+            print(f"Failed to load existing embeddings: {e}")
+
     stay_tasks = []
     
     print("🤖 Preparing data for parallel generation...")
@@ -97,33 +108,45 @@ def main(limit=None):
             if pd.isna(t) or t <= outtime:
                 valid_notes.append(note['TEXT'])
                 
-        stay_tasks.append({
-            'stay_id': stay_id,
-            'valid_notes': valid_notes
-        })
+        is_processed = False
+        if stay_id in embeddings_dict:
+            val = embeddings_dict[stay_id]
+            if isinstance(val, dict):
+                is_processed = np.any(val.get('embedding', []))
+            else:
+                is_processed = np.any(val)
+
+        if not is_processed:
+            stay_tasks.append({
+                'stay_id': stay_id,
+                'valid_notes': valid_notes
+            })
         
     def process_task(task):
         stay_id = task['stay_id']
         valid_notes = task['valid_notes']
         if not valid_notes:
-            return stay_id, np.zeros(4096, dtype=np.float32)
+            return stay_id, "", np.zeros(4096, dtype=np.float32)
             
         combined_text = "\n\n---\n\n".join([clean_text(txt) for txt in valid_notes])
         summary = summarize_notes(combined_text)
         emb = embed_text(summary)
-        return stay_id, emb
+        return stay_id, summary, emb
 
     print("⚡ Generating Summaries and Embeddings via Ollama (Concurrent Batching)...")
     # Using 8-16 workers is usually enough to fully saturate a 48GB GPU with Ollama's auto-batching.
     MAX_WORKERS = 8
+    save_counter = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_task, task): task for task in stay_tasks}
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(stay_tasks)):
-            stay_id, emb = future.result()
-            embeddings_dict[stay_id] = emb
+            stay_id, summary, emb = future.result()
+            embeddings_dict[stay_id] = {'summary': summary, 'embedding': emb}
+            save_counter += 1
+            if save_counter % 500 == 0:
+                with open(output_file, 'wb') as f:
+                    pickle.dump(embeddings_dict, f)
 
-    output_file = 'output/mimic3_note_embeddings.pkl'
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, 'wb') as f:
         pickle.dump(embeddings_dict, f)
     
