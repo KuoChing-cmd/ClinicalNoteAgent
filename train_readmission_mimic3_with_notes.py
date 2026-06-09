@@ -304,11 +304,11 @@ def flatten_features(X_seq, X_static, X_mh):
     return np.concatenate([np.mean(X_seq, axis=1), X_seq[:, -1, :], X_static, X_mh], axis=1)
 
 def main():
-    if not os.path.exists('mimic3_note_embeddings.pkl'):
+    if not os.path.exists('output/mimic3_note_embeddings.pkl'):
         print("Embeddings file not found! Please run preprocess_note_embeddings.py first.")
         return
         
-    with open('mimic3_note_embeddings.pkl', 'rb') as f:
+    with open('output/mimic3_note_embeddings.pkl', 'rb') as f:
         embeddings_dict = pickle.load(f)
         
     X_seq, X_static, X_mh, X_note, Y, static_dims, multihot_dims = fetch_mimic3_data(embeddings_dict)
