@@ -78,6 +78,7 @@ class LSTMLateFusionWithNotes(nn.Module):
         # 4. Note processing
         if self.use_notes:
             self.note_head = nn.Sequential(
+                nn.LayerNorm(note_dim),
                 nn.Linear(note_dim, 64),
                 nn.ReLU(),
                 nn.Dropout(0.3)
@@ -86,6 +87,7 @@ class LSTMLateFusionWithNotes(nn.Module):
             
         # 5. Final Classification Head
         self.classifier = nn.Sequential(
+            nn.LayerNorm(fused_dim),
             nn.Dropout(0.3),
             nn.Linear(fused_dim, 32),
             nn.ReLU(),
@@ -127,7 +129,9 @@ class LSTMLateFusionWithNotes(nn.Module):
             reprs.append(self.mh_head(torch.cat(mh_embs, dim=1)))
             
         if self.use_notes and x_note is not None:
-            reprs.append(self.note_head(x_note))
+            import torch.nn.functional as F
+            x_note_norm = F.normalize(x_note, p=2, dim=1)
+            reprs.append(self.note_head(x_note_norm))
             
         fused = torch.cat(reprs, dim=1) if len(reprs) > 1 else reprs[0]
         return self.classifier(fused).squeeze(-1)
