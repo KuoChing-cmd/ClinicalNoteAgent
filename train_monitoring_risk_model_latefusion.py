@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import math
+import pickle
 import time as pytime
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -576,6 +577,7 @@ class MonitoringRiskLateFusion(nn.Module):
             self.procedure_dim = int(self.static_schema.get("procedure_dim", 0))
             self.hcpcs_dim = int(self.static_schema.get("hcpcs_dim", 0))
             self.pharmacy_dim = int(self.static_schema.get("pharmacy_dim", 0))
+            self.operational_dim = int(self.static_schema.get("operational_dim", 0))
 
             offset = 0
             self.slices: dict[str, tuple[int, int]] = {}
@@ -590,6 +592,7 @@ class MonitoringRiskLateFusion(nn.Module):
                 ("procedure", self.procedure_dim),
                 ("hcpcs", self.hcpcs_dim),
                 ("pharmacy", self.pharmacy_dim),
+                ("operational", self.operational_dim),
             ]:
                 if dim > 0:
                     self.slices[name] = (offset, offset + dim)
@@ -604,6 +607,13 @@ class MonitoringRiskLateFusion(nn.Module):
             if self.demographics_dim > 0:
                 self.demographics_head = nn.Sequential(
                     nn.Linear(self.demographics_dim, max(8, hidden_dim // 4)),
+                    nn.ReLU(),
+                )
+                static_repr_dim += max(8, hidden_dim // 4)
+                
+            if self.operational_dim > 0:
+                self.operational_head = nn.Sequential(
+                    nn.Linear(self.operational_dim, max(8, hidden_dim // 4)),
                     nn.ReLU(),
                 )
                 static_repr_dim += max(8, hidden_dim // 4)
@@ -675,6 +685,10 @@ class MonitoringRiskLateFusion(nn.Module):
         x_demo = self._slice_tensor(x_static, "demographics")
         if x_demo is not None and x_demo.shape[1] > 0:
             parts.append(self.demographics_head(x_demo))
+            
+        x_op = self._slice_tensor(x_static, "operational")
+        if x_op is not None and x_op.shape[1] > 0:
+            parts.append(self.operational_head(x_op))
 
         for group_name, emb, is_multihot in [
             ("marital", self.marital_emb, False),
@@ -715,7 +729,193 @@ class MonitoringRiskLateFusion(nn.Module):
             fused = seq_repr
         logits = self.head(fused).squeeze(-1)
         return logits
+        return logits
 
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(0, 1)
+        x = x + self.pe[:x.size(0)]
+        x = self.dropout(x)
+        return x.transpose(0, 1)
+
+
+class TransformerSeqEncoder(nn.Module):
+    def __init__(
+        self,
+        seq_input_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        dropout: float,
+        nhead: int,
+    ) -> None:
+        super().__init__()
+        self.seq_proj = nn.Linear(seq_input_dim, hidden_dim)
+        self.pos_encoder = PositionalEncoding(hidden_dim, dropout)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, 
+            nhead=nhead, 
+            dim_feedforward=hidden_dim * 4, 
+            dropout=dropout, 
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
+
+    def forward(self, x_seq: torch.Tensor, mask_indices: torch.Tensor | None = None, extra_tokens: torch.Tensor | None = None) -> torch.Tensor:
+        x = self.seq_proj(x_seq)  # [B, T, H]
+        
+        if mask_indices is not None:
+            # mask_indices: [B, T] boolean tensor
+            expanded_mask = mask_indices.unsqueeze(-1).expand_as(x)
+            x = torch.where(expanded_mask, self.mask_token, x)
+            
+        B = x.shape[0]
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        
+        if extra_tokens is not None:
+            x = torch.cat((cls_tokens, extra_tokens, x), dim=1)
+        else:
+            x = torch.cat((cls_tokens, x), dim=1)
+            
+        x = self.pos_encoder(x)
+        out = self.transformer_encoder(x)
+        return out
+
+
+class TransformerPretrainer(nn.Module):
+    def __init__(self, encoder: TransformerSeqEncoder, seq_input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.encoder = encoder
+        self.reconstruction_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, seq_input_dim)
+        )
+        
+    def forward(self, x_seq: torch.Tensor, mask_indices: torch.Tensor) -> torch.Tensor:
+        encoded = self.encoder(x_seq, mask_indices)
+        encoded_seq = encoded[:, 1:, :]  # Drop CLS token
+        return self.reconstruction_head(encoded_seq)
+
+
+class MonitoringRiskTransformerLateFusion(MonitoringRiskLateFusion):
+    def __init__(
+        self,
+        seq_input_dim: int = 1,
+        static_input_dim: int = 0,
+        static_schema: dict[str, int] | None = None,
+        hidden_dim: int = 64,
+        num_layers: int = 1,
+        dropout: float = 0.3,
+        nhead: int = 4,
+    ) -> None:
+        super().__init__(seq_input_dim, static_input_dim, static_schema, hidden_dim, num_layers, dropout)
+        
+        self.lstm = None
+        self.encoder = TransformerSeqEncoder(
+            seq_input_dim=seq_input_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            nhead=nhead
+        )
+        
+        if self.static_input_dim > 0:
+            static_hidden = max(16, hidden_dim // 2)
+            self.static_to_hidden = nn.Linear(static_hidden, hidden_dim)
+            
+        self.head = nn.Sequential(
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(p=dropout / 2),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, x_seq: torch.Tensor, x_static: torch.Tensor | None = None) -> torch.Tensor:
+        if self.static_input_dim > 0:
+            if x_static is None:
+                raise ValueError("x_static is required when static_input_dim > 0")
+            static_repr = self.static_head(self._encode_static(x_static))
+            static_token = self.static_to_hidden(static_repr).unsqueeze(1)
+            out = self.encoder(x_seq, extra_tokens=static_token)
+        else:
+            out = self.encoder(x_seq)
+            
+        cls_repr = out[:, 0, :]
+        logits = self.head(cls_repr).squeeze(-1)
+        return logits
+
+
+class MonitoringRiskTransformerLateFusionWithNotes(MonitoringRiskTransformerLateFusion):
+    def __init__(
+        self,
+        seq_input_dim: int = 1,
+        static_input_dim: int = 0,
+        static_schema: dict[str, int] | None = None,
+        note_dim: int = 4096,
+        hidden_dim: int = 64,
+        num_layers: int = 1,
+        dropout: float = 0.3,
+        nhead: int = 4,
+    ) -> None:
+        super().__init__(
+            seq_input_dim=seq_input_dim,
+            static_input_dim=static_input_dim,
+            static_schema=static_schema,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            nhead=nhead
+        )
+        
+        self.note_dim = note_dim
+        
+        self.note_head = nn.Sequential(
+            nn.LayerNorm(note_dim),
+            nn.Dropout(p=dropout),
+            nn.Linear(note_dim, hidden_dim),
+        )
+
+    def forward(self, x_seq: torch.Tensor, x_static: torch.Tensor | None = None, x_note: torch.Tensor | None = None) -> torch.Tensor:
+        tokens_to_add = []
+        
+        if self.static_input_dim > 0:
+            if x_static is None:
+                raise ValueError("x_static is required when static_input_dim > 0")
+            static_repr = self.static_head(self._encode_static(x_static))
+            static_token = self.static_to_hidden(static_repr).unsqueeze(1)
+            tokens_to_add.append(static_token)
+            
+        if x_note is not None:
+            x_note_norm = torch.nn.functional.normalize(x_note, p=2, dim=1)
+            note_repr = self.note_head(x_note_norm)
+            note_token = note_repr.unsqueeze(1)
+            tokens_to_add.append(note_token)
+            
+        if len(tokens_to_add) > 0:
+            extra_tokens = torch.cat(tokens_to_add, dim=1)
+            out = self.encoder(x_seq, extra_tokens=extra_tokens)
+        else:
+            out = self.encoder(x_seq)
+            
+        cls_repr = out[:, 0, :]
+        logits = self.head(cls_repr).squeeze(-1)
+        return logits
 
 class FocalLossWithLogits(nn.Module):
     def __init__(
@@ -846,6 +1046,12 @@ def _classification_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: f
     recall = tp / max(1, (tp + fn))
     f1 = 2.0 * precision * recall / max(1e-12, (precision + recall))
     accuracy = (tp + tn) / total
+    
+    brier_score = float(np.mean((y_prob - y_true) ** 2))
+    # Brier skill score: 1 - Brier / Brier_ref, where Brier_ref is always predicting the base rate
+    base_rate = np.mean(y_true)
+    brier_ref = float(np.mean((base_rate - y_true) ** 2))
+    brier_skill_score = 1.0 - (brier_score / max(1e-12, brier_ref))
 
     return {
         "threshold": float(threshold),
@@ -855,6 +1061,8 @@ def _classification_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: f
         "f1": float(f1),
         "roc_auc": _auc_score(y_true, y_prob),
         "pr_auc": _prauc_score(y_true, y_prob),
+        "brier_score": brier_score,
+        "brier_skill_score": brier_skill_score,
         "tp": float(tp),
         "tn": float(tn),
         "fp": float(fp),
@@ -955,9 +1163,11 @@ def build_dataset(
     selected_channels: list[str] | None,
     seq_aggregation: str,
     sql_in_batch_size: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
+    note_embeddings_dict: dict[int, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, dict[str, int]]:
     xs_seq: list[np.ndarray] = []
     xs_static: list[np.ndarray] = []
+    xs_note: list[np.ndarray] = []
     ys: list[int] = []
 
     marital_vocab, insurance_vocab, admission_type_vocab, admit_to_vocab = _build_static_feature_vocabs(
@@ -1264,6 +1474,9 @@ def build_dataset(
         seq = _to_fixed_len_sequence(vital_channels, target_len=seq_len, mode=seq_aggregation)
         xs_seq.append(seq)
         xs_static.append(static_fused)
+        if note_embeddings_dict is not None:
+            n_emb = note_embeddings_dict.get(int(s.stay_id), np.zeros((4096,), dtype=np.float32)).astype(np.float32)
+            xs_note.append(n_emb)
         ys.append(int(s.label))
 
         if idx % 50 == 0:
@@ -1292,9 +1505,14 @@ def build_dataset(
     }
 
     y = np.asarray(ys, dtype=np.float32)
+    x_note = np.stack(xs_note, axis=0).astype(np.float32) if xs_note else None
+    
     logger.info("dataset built: x_seq.shape=%s, x_static.shape=%s, y.shape=%s", x_seq.shape, x_static.shape, y.shape)
+    if x_note is not None:
+        logger.info("x_note.shape=%s", x_note.shape)
+        
     logger.info("static schema: %s", json.dumps(static_schema, ensure_ascii=False))
-    return x_seq, x_static, y, static_schema
+    return x_seq, x_static, y, x_note, static_schema
 
 
 def _build_source_aux_channels(
@@ -1386,6 +1604,7 @@ def train_and_evaluate(
     x_seq: np.ndarray,
     x_static: np.ndarray,
     y: np.ndarray,
+    x_note: np.ndarray | None = None,
     static_schema: dict[str, int] | None,
     epochs: int,
     batch_size: int,
@@ -1403,57 +1622,89 @@ def train_and_evaluate(
     early_stop_min_delta: float,
     early_stop_monitor: str,
     device: torch.device,
+    model_class: type = MonitoringRiskLateFusion,
+    pretrained_encoder_state: dict[str, Any] | None = None,
+    model_kwargs: dict[str, Any] | None = None,
+    train_idx: np.ndarray | None = None,
+    val_idx: np.ndarray | None = None,
+    test_idx: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    rng = np.random.default_rng(seed)
-    idx = np.arange(len(x_seq))
-    rng.shuffle(idx)
-
-    x_seq = x_seq[idx]
-    x_static = x_static[idx]
-    y = y[idx]
-
-    if val_ratio < 0.0 or test_ratio < 0.0 or (val_ratio + test_ratio) >= 1.0:
-        raise ValueError("val_ratio and test_ratio must be >=0 and val_ratio + test_ratio < 1")
-
     n_total = len(x_seq)
-    n_test = int(math.floor(test_ratio * n_total))
-    n_val = int(math.floor(val_ratio * n_total))
-    n_train = n_total - n_val - n_test
+    
+    if train_idx is not None and val_idx is not None and test_idx is not None:
+        logger.info("Using provided train/val/test splits")
+        x_seq_train, x_seq_val, x_seq_test = x_seq[train_idx], x_seq[val_idx], x_seq[test_idx]
+        x_static_train, x_static_val, x_static_test = x_static[train_idx], x_static[val_idx], x_static[test_idx]
+        y_train, y_val, y_test = y[train_idx], y[val_idx], y[test_idx]
+    else:
+        rng = np.random.default_rng(seed)
+        idx = np.arange(len(x_seq))
+        rng.shuffle(idx)
 
-    # Keep all splits non-empty when ratios are configured.
-    if n_train <= 0:
-        raise ValueError("Train split is empty. Reduce val_ratio/test_ratio or increase train-limit")
-    if test_ratio > 0.0 and n_test == 0:
-        n_test = 1
-        n_train -= 1
-    if val_ratio > 0.0 and n_val == 0:
-        n_val = 1
-        n_train -= 1
-    if n_train <= 0:
-        raise ValueError("Invalid split after enforcing non-empty val/test sets")
+        x_seq = x_seq[idx]
+        x_static = x_static[idx]
+        y = y[idx]
 
-    train_end = n_train
-    val_end = n_train + n_val
-    x_seq_train, x_seq_val, x_seq_test = x_seq[:train_end], x_seq[train_end:val_end], x_seq[val_end:]
-    x_static_train, x_static_val, x_static_test = (
-        x_static[:train_end],
-        x_static[train_end:val_end],
-        x_static[val_end:],
-    )
-    y_train, y_val, y_test = y[:train_end], y[train_end:val_end], y[val_end:]
+        if val_ratio < 0.0 or test_ratio < 0.0 or (val_ratio + test_ratio) >= 1.0:
+            raise ValueError("val_ratio and test_ratio must be >=0 and val_ratio + test_ratio < 1")
+
+        n_test = int(math.floor(test_ratio * n_total))
+        n_val = int(math.floor(val_ratio * n_total))
+        n_train = n_total - n_val - n_test
+
+        # Keep all splits non-empty when ratios are configured.
+        if n_train <= 0:
+            raise ValueError("Train split is empty. Reduce val_ratio/test_ratio or increase train-limit")
+        if test_ratio > 0.0 and n_test == 0:
+            n_test = 1
+            n_train -= 1
+        if val_ratio > 0.0 and n_val == 0:
+            n_val = 1
+            n_train -= 1
+        if n_train <= 0:
+            raise ValueError("Invalid split after enforcing non-empty val/test sets")
+
+        train_end = n_train
+        val_end = n_train + n_val
+        x_seq_train, x_seq_val, x_seq_test = x_seq[:train_end], x_seq[train_end:val_end], x_seq[val_end:]
+        x_static_train, x_static_val, x_static_test = (
+            x_static[:train_end],
+            x_static[train_end:val_end],
+            x_static[val_end:],
+        )
+        if x_note is not None:
+            x_note_train, x_note_val, x_note_test = (
+                x_note[:train_end],
+                x_note[train_end:val_end],
+                x_note[val_end:],
+            )
+        else:
+            x_note_train = x_note_val = x_note_test = None
+            
+        y_train, y_val, y_test = y[:train_end], y[train_end:val_end], y[val_end:]
 
     logger.info("train uses full training split (no class downsampling)")
 
     seq_input_dim = int(x_seq_train.shape[-1])
     static_input_dim = int(x_static_train.shape[-1])
-    model = MonitoringRiskLateFusion(
-        seq_input_dim=seq_input_dim,
-        static_input_dim=static_input_dim,
-        static_schema=static_schema,
-        hidden_dim=128,
-        num_layers=2,
-        dropout=0.3,
-    ).to(device)
+    
+    kwargs = {
+        "seq_input_dim": seq_input_dim,
+        "static_input_dim": static_input_dim,
+        "static_schema": static_schema,
+        "hidden_dim": 128,
+        "num_layers": 2,
+        "dropout": 0.3,
+    }
+    if model_kwargs is not None:
+        kwargs.update(model_kwargs)
+        
+    model = model_class(**kwargs)
+    
+    if pretrained_encoder_state is not None and hasattr(model, 'encoder'):
+        logger.info("Loading pretrained encoder weights...")
+        model.encoder.load_state_dict(pretrained_encoder_state)
+    model = model.to(device)
     logger.info("model_input_dims | seq=%d static=%d", seq_input_dim, static_input_dim)
     n_pos = int(y_train.sum())
     n_neg = int(len(y_train) - n_pos)
@@ -1481,6 +1732,7 @@ def train_and_evaluate(
 
     xv_seq = torch.from_numpy(x_seq_val).to(device)
     xv_static = torch.from_numpy(x_static_val).to(device)
+    xv_note = torch.from_numpy(x_note_val).to(device) if x_note_val is not None else None
     yv = torch.from_numpy(y_val).to(device)
 
     monitor_mode = "min" if early_stop_monitor == "val_loss" else "max"
@@ -1508,9 +1760,14 @@ def train_and_evaluate(
             sl = order[start : start + batch_size]
             xb_seq = torch.from_numpy(x_seq_train[sl]).to(device)
             xb_static = torch.from_numpy(x_static_train[sl]).to(device)
+            xb_note = torch.from_numpy(x_note_train[sl]).to(device) if x_note_train is not None else None
             yb = torch.from_numpy(y_train[sl]).to(device)
 
-            logits = model(xb_seq, xb_static)
+            if xb_note is not None:
+                logits = model(xb_seq, xb_static, xb_note)
+            else:
+                logits = model(xb_seq, xb_static)
+                
             loss = compute_loss(logits, yb)
 
             optim.zero_grad()
@@ -1527,7 +1784,10 @@ def train_and_evaluate(
 
         model.eval()
         with torch.no_grad():
-            val_logits = model(xv_seq, xv_static)
+            if xv_note is not None:
+                val_logits = model(xv_seq, xv_static, xv_note)
+            else:
+                val_logits = model(xv_seq, xv_static)
             val_loss = float(compute_loss(val_logits, yv).item())
             val_probs = torch.sigmoid(val_logits).cpu().numpy().astype(np.float64)
 
@@ -1594,8 +1854,14 @@ def train_and_evaluate(
     with torch.no_grad():
         xt_seq = torch.from_numpy(x_seq_test).to(device)
         xt_static = torch.from_numpy(x_static_test).to(device)
-        val_probs = torch.sigmoid(model(xv_seq, xv_static)).cpu().numpy()
-        test_probs = torch.sigmoid(model(xt_seq, xt_static)).cpu().numpy()
+        xt_note = torch.from_numpy(x_note_test).to(device) if x_note_test is not None else None
+        
+        if xv_note is not None:
+            val_probs = torch.sigmoid(model(xv_seq, xv_static, xv_note)).cpu().numpy()
+            test_probs = torch.sigmoid(model(xt_seq, xt_static, xt_note)).cpu().numpy()
+        else:
+            val_probs = torch.sigmoid(model(xv_seq, xv_static)).cpu().numpy()
+            test_probs = torch.sigmoid(model(xt_seq, xt_static)).cpu().numpy()
 
     val_probs_f64 = val_probs.astype(np.float64)
     test_probs_f64 = test_probs.astype(np.float64)
@@ -1674,9 +1940,85 @@ def train_and_evaluate(
         "test_metrics_threshold_0.5": test_metrics_default,
         "test_metrics_validation_best_threshold": test_metrics_val_best,
         "test_metrics_selected_threshold": test_metrics_selected,
+        "test_probs": test_probs_f64.tolist(),
+        "epoch_monitoring": epoch_monitoring,
         "state_dict": model.state_dict(),
     }
     return result
+
+
+def pretrain_transformer_encoder(
+    x_seq: np.ndarray,
+    epochs: int = 30,
+    batch_size: int = 128,
+    lr: float = 1e-3,
+    mask_prob: float = 0.15,
+    hidden_dim: int = 128,
+    num_layers: int = 2,
+    nhead: int = 4,
+    device: torch.device | None = None,
+    **model_kwargs,
+) -> dict[str, Any]:
+    """
+    Masked time-series pretraining for the TransformerSeqEncoder.
+    Returns the state dict of the pretrained encoder.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+    seq_input_dim = x_seq.shape[-1]
+    
+    encoder = TransformerSeqEncoder(
+        seq_input_dim=seq_input_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        dropout=0.1,
+        nhead=nhead,
+        **model_kwargs,
+    )
+    model = TransformerPretrainer(encoder, seq_input_dim, hidden_dim).to(device)
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss(reduction='none')
+    
+    from torch.utils.data import TensorDataset, DataLoader
+    dataset = TensorDataset(torch.from_numpy(x_seq))
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    logger.info("Starting Masked Time-Series Pretraining (%d epochs)...", epochs)
+    
+    model.train()
+    for epoch in range(1, epochs + 1):
+        total_loss = 0.0
+        total_items = 0
+        
+        for (batch_x,) in loader:
+            batch_x = batch_x.to(device) # [B, T, F]
+            # Generate mask
+            mask = torch.rand(batch_x.shape[:2], device=device) < mask_prob
+            
+            optimizer.zero_grad()
+            preds = model(batch_x, mask) # [B, T, F]
+            
+            # Loss only on masked positions
+            loss_all = criterion(preds, batch_x) # [B, T, F]
+            loss_all = loss_all.mean(dim=-1) # [B, T]
+            
+            # Mask out non-masked positions
+            masked_loss = (loss_all * mask.float()).sum() / (mask.float().sum() + 1e-8)
+            
+            masked_loss.backward()
+            optimizer.step()
+            
+            total_loss += masked_loss.item() * batch_x.size(0)
+            total_items += batch_x.size(0)
+            
+        avg_loss = total_loss / total_items
+        if epoch % 5 == 0 or epoch == 1:
+            logger.info("Pretrain Epoch %d/%d | MSE Loss: %.4f", epoch, epochs, avg_loss)
+            
+    logger.info("Pretraining completed.")
+    return encoder.state_dict()
 
 
 def parse_args() -> argparse.Namespace:
@@ -1851,6 +2193,19 @@ def parse_args() -> argparse.Namespace:
         default="output/dataset_cache/monitoring_risk_latefusion",
         help="Directory for dataset cache files.",
     )
+    
+    parser.add_argument(
+        "--use-notes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to use clinical note embeddings.",
+    )
+    parser.add_argument(
+        "--note-embeddings-path",
+        default="output/mimic3_note_embeddings.pkl",
+        help="Path to clinical note embeddings pkl file.",
+    )
+    
     return parser.parse_args()
 
 
@@ -1907,6 +2262,8 @@ def _build_dataset_cache_key_from_args(args: argparse.Namespace) -> str:
         "channels": str(args.channels) if args.channels is not None else None,
         "seq_len": int(args.seq_len),
         "seq_aggregation": str(args.seq_aggregation),
+        "use_notes": bool(getattr(args, "use_notes", False)),
+        "note_embeddings_path": str(getattr(args, "note_embeddings_path", "")) if getattr(args, "use_notes", False) else None,
     }
     if data_source == "db":
         payload.update(
@@ -1921,7 +2278,7 @@ def _build_dataset_cache_key_from_args(args: argparse.Namespace) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def _load_dataset_cache(cache_file: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]] | None:
+def _load_dataset_cache(cache_file: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, dict[str, int]] | None:
     if not cache_file.exists():
         return None
     try:
@@ -1929,9 +2286,10 @@ def _load_dataset_cache(cache_file: Path) -> tuple[np.ndarray, np.ndarray, np.nd
             x_seq = data["x_seq"].astype(np.float32)
             x_static = data["x_static"].astype(np.float32)
             y = data["y"].astype(np.float32)
+            x_note = data["x_note"].astype(np.float32) if "x_note" in data else None
             static_schema_json = data["static_schema_json"].item()
             static_schema = json.loads(static_schema_json)
-        return x_seq, x_static, y, static_schema
+        return x_seq, x_static, y, x_note, static_schema
     except Exception as exc:
         logger.warning("dataset cache load failed (%s): %s", cache_file, exc)
         return None
@@ -1942,19 +2300,23 @@ def _save_dataset_cache(
     x_seq: np.ndarray,
     x_static: np.ndarray,
     y: np.ndarray,
+    x_note: np.ndarray | None,
     static_schema: dict[str, int],
 ) -> None:
     cache_file.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        cache_file,
-        x_seq=x_seq.astype(np.float32),
-        x_static=x_static.astype(np.float32),
-        y=y.astype(np.float32),
-        static_schema_json=np.asarray(json.dumps(static_schema, ensure_ascii=False)),
-    )
+    save_dict = {
+        "x_seq": x_seq.astype(np.float32),
+        "x_static": x_static.astype(np.float32),
+        "y": y.astype(np.float32),
+        "static_schema_json": np.asarray(json.dumps(static_schema, ensure_ascii=False)),
+    }
+    if x_note is not None:
+        save_dict["x_note"] = x_note.astype(np.float32)
+        
+    np.savez(cache_file, **save_dict)
 
 
-def _load_local_snapshot_dataset(snapshot_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
+def _load_local_snapshot_dataset(snapshot_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, dict[str, int]]:
     import pyarrow.parquet as pq
 
     meta_path = snapshot_dir / "meta.json"
@@ -2009,7 +2371,7 @@ def _load_local_snapshot_dataset(snapshot_dir: Path) -> tuple[np.ndarray, np.nda
         x_static.shape,
         y.shape,
     )
-    return x_seq, x_static, y, static_schema
+    return x_seq, x_static, y, None, static_schema
 
 
 def main() -> None:
@@ -2042,6 +2404,7 @@ def main() -> None:
 
     x_seq: np.ndarray | None = None
     x_static: np.ndarray | None = None
+    x_note: np.ndarray | None = None
     y: np.ndarray | None = None
     static_schema: dict[str, int] | None = None
     cache_key = _build_dataset_cache_key_from_args(args)
@@ -2054,7 +2417,7 @@ def main() -> None:
     if bool(args.use_dataset_cache):
         cache_data = _load_dataset_cache(cache_file)
         if cache_data is not None:
-            x_seq, x_static, y, static_schema = cache_data
+            x_seq, x_static, y, x_note, static_schema = cache_data
             logger.info(
                 "dataset cache hit | key=%s file=%s x_seq.shape=%s x_static.shape=%s y.shape=%s",
                 cache_key,
@@ -2071,7 +2434,7 @@ def main() -> None:
             snapshot_dir = Path(args.local_snapshot_dir)
             if not snapshot_dir.is_absolute():
                 snapshot_dir = REPO_ROOT / snapshot_dir
-            x_seq, x_static, y, static_schema = _load_local_snapshot_dataset(snapshot_dir)
+            x_seq, x_static, y, x_note, static_schema = _load_local_snapshot_dataset(snapshot_dir)
         else:
             config = DatabaseConfig(
                 host=args.db_host,
@@ -2088,7 +2451,19 @@ def main() -> None:
                     limit=int(args.train_limit),
                     horizon_hours=int(args.horizon_hours),
                 )
-                x_seq, x_static, y, static_schema = build_dataset(
+                note_embeddings_dict = None
+                if getattr(args, "use_notes", False):
+                    note_path = Path(args.note_embeddings_path)
+                    if not note_path.is_absolute():
+                        note_path = REPO_ROOT / note_path
+                    if note_path.exists():
+                        logger.info("Loading clinical note embeddings from %s", note_path)
+                        with open(note_path, "rb") as f:
+                            note_embeddings_dict = pickle.load(f)
+                    else:
+                        logger.warning("Clinical note embeddings not found at %s. Proceeding without notes.", note_path)
+
+                x_seq, x_static, y, x_note, static_schema = build_dataset(
                     extractor=extractor,
                     monitor_agent=monitor_agent,
                     stay_rows=train_rows,
@@ -2118,18 +2493,27 @@ def main() -> None:
                     selected_channels=selected_channels,
                     seq_aggregation=str(args.seq_aggregation),
                     sql_in_batch_size=int(args.sql_in_batch_size),
+                    note_embeddings_dict=note_embeddings_dict,
                 )
 
         if bool(args.use_dataset_cache):
-            _save_dataset_cache(cache_file, x_seq, x_static, y, static_schema or {})
+            _save_dataset_cache(cache_file, x_seq, x_static, y, x_note, static_schema or {})
             logger.info("dataset cache saved | key=%s file=%s", cache_key, cache_file)
 
     if x_seq is None or x_static is None or y is None or static_schema is None:
         raise RuntimeError("dataset build failed: x_seq/x_static/y/static_schema are empty")
+        
+    model_cls = MonitoringRiskTransformerLateFusion
+    if getattr(args, "use_notes", False):
+        model_cls = MonitoringRiskTransformerLateFusionWithNotes
+        logger.info("Using model: MonitoringRiskTransformerLateFusionWithNotes")
+    else:
+        logger.info("Using model: MonitoringRiskTransformerLateFusion")
 
     result = train_and_evaluate(
         x_seq=x_seq,
         x_static=x_static,
+        x_note=x_note,
         y=y,
         static_schema=static_schema,
         epochs=int(args.epochs),
@@ -2148,6 +2532,7 @@ def main() -> None:
         early_stop_min_delta=float(args.early_stop_min_delta),
         early_stop_monitor=str(args.early_stop_monitor),
         device=device,
+        model_class=model_cls,
     )
 
     state_dict = result.pop("state_dict")
