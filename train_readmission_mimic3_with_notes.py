@@ -306,7 +306,11 @@ def fetch_mimic3_data(embeddings_dict):
         mh_vecs.append(rx_dict.get(hadm, np.zeros(rx_dim, dtype=np.float32)))
         X_mh.append(np.concatenate(mh_vecs))
         
-        X_note.append(embeddings_dict[sid])
+        val = embeddings_dict.get(sid, np.zeros(4096, dtype=np.float32))
+        if isinstance(val, dict):
+            val = val.get('embedding', np.zeros(4096, dtype=np.float32))
+        X_note.append(np.array(val, dtype=np.float32))
+        
         Y.append(stay['readmitted'])
         
     return np.array(X_seq), np.array(X_static, dtype=np.float32), np.array(X_mh, dtype=np.float32), np.array(X_note), np.array(Y), static_dims, multihot_dims
