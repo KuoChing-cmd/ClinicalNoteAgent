@@ -269,6 +269,189 @@ class TransformerEarlyFusionWithNotes(nn.Module):
         cls_out = out[:, 0, :]
         return self.classifier(cls_out).squeeze(-1)
 
+
+class CrossModalAttnFusion(nn.Module):
+    """
+    Cross-Modal Attention Fusion for readmission prediction.
+
+    Architecture:
+      1. LSTM encodes the physiological time series → hidden states H [B, T, d]
+      2. Note embedding is projected into M 'virtual tokens' [B, M, d]
+         (M > 1 gives the attention head diversity; default M=4)
+      3. Cross-Attention: Q = H (time series), K = V = note tokens
+         → each time step selectively reads the relevant note semantics
+      4. Residual + LayerNorm stabilises gradients
+      5. Temporal self-attention pools the enriched H → seq_repr [B, d]
+      6. Demographics + sparse codes are fused via late concat → classifier
+
+    Saved attention weights allow post-hoc visualisation of which time
+    steps are most influenced by which note concepts.
+    """
+    def __init__(self, seq_dim, static_dims=None, multihot_dims=None,
+                 hidden_dim=64, note_dim=4096, nhead=4,
+                 num_virtual_tokens=4, num_lstm_layers=2):
+        super().__init__()
+        self.static_dims   = static_dims   or {}
+        self.multihot_dims = multihot_dims or {}
+        self.hidden_dim    = hidden_dim
+        self.M             = num_virtual_tokens
+
+        # ── 1. Physiological sequence encoder ────────────────────────────────
+        self.lstm = nn.LSTM(
+            input_size=seq_dim, hidden_size=hidden_dim,
+            num_layers=num_lstm_layers, batch_first=True,
+            dropout=0.1 if num_lstm_layers > 1 else 0.0
+        )
+
+        # ── 2. Note → M virtual tokens ────────────────────────────────────────
+        # Gradual compression avoids information bottleneck at 4096 → hidden_dim
+        self.note_proj = nn.Sequential(
+            nn.LayerNorm(note_dim),
+            nn.Linear(note_dim, hidden_dim * 4), nn.GELU(), nn.Dropout(0.2),
+            nn.Linear(hidden_dim * 4, hidden_dim * num_virtual_tokens),
+        )
+        # note_proj output will be reshaped to [B, M, hidden_dim]
+
+        # ── 3. Cross-Attention block (seq queries ← note keys/values) ─────────
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim, num_heads=nhead,
+            dropout=0.1, batch_first=True
+        )
+        self.cross_norm  = nn.LayerNorm(hidden_dim)   # post-attention norm
+        self.cross_ff    = nn.Sequential(             # position-wise FFN
+            nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+        self.cross_ff_norm = nn.LayerNorm(hidden_dim)
+
+        # ── 4. Temporal self-attention pooling ────────────────────────────────
+        self.temporal_attn = nn.Linear(hidden_dim, 1)
+
+        fused_dim = hidden_dim
+
+        # ── 5. Static (demographics) ──────────────────────────────────────────
+        self.has_static = len(self.static_dims) > 0
+        if self.has_static:
+            self.emb_dict      = nn.ModuleDict()
+            static_repr_dim    = 0
+            for name, vocab_size in self.static_dims.items():
+                if name == 'age': continue
+                emb_dim = max(4, min(16, vocab_size // 2))
+                self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
+                static_repr_dim += emb_dim
+            if 'age' in self.static_dims:
+                static_repr_dim += 1
+            self.static_head = nn.Sequential(
+                nn.Linear(static_repr_dim, 32), nn.ReLU()
+            )
+            fused_dim += 32
+
+        # ── 6. Sparse multi-hot (ICD / DRG / Proc / Rx) ───────────────────────
+        self.has_multihot = len(self.multihot_dims) > 0
+        if self.has_multihot:
+            self.mh_emb_dict = nn.ModuleDict()
+            mh_repr_dim = 0
+            for name, vocab_size in self.multihot_dims.items():
+                emb_dim = max(8, min(32, vocab_size // 4))
+                self.mh_emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
+                mh_repr_dim += emb_dim
+            self.mh_head = nn.Sequential(
+                nn.Linear(mh_repr_dim, 32), nn.ReLU()
+            )
+            fused_dim += 32
+
+        # ── 7. Classification head ────────────────────────────────────────────
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(fused_dim),
+            nn.Dropout(0.3),
+            nn.Linear(fused_dim, 64), nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 1)
+        )
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+    def _multihot_to_embedding(self, x_group, emb):
+        summed = x_group @ emb.weight
+        denom  = torch.clamp(x_group.sum(dim=1, keepdim=True), min=1.0)
+        return summed / denom
+
+    def _encode_static(self, x_static):
+        static_embs, col_idx = [], 0
+        for name, _ in self.static_dims.items():
+            val = x_static[:, col_idx]
+            if name == 'age':
+                static_embs.append(val.unsqueeze(1).float())
+            else:
+                static_embs.append(self.emb_dict[name](val.long()))
+            col_idx += 1
+        return self.static_head(torch.cat(static_embs, dim=1))
+
+    def _encode_multihot(self, x_mh):
+        mh_embs, col_offset = [], 0
+        for name, vocab_size in self.multihot_dims.items():
+            group = x_mh[:, col_offset : col_offset + vocab_size]
+            mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name]))
+            col_offset += vocab_size
+        return self.mh_head(torch.cat(mh_embs, dim=1))
+
+    # ── forward ──────────────────────────────────────────────────────────────
+    def forward(self, x_seq, x_static=None, x_mh=None, x_note=None,
+                return_attn=False):
+        """
+        Args:
+            x_seq    : [B, T, seq_dim]   physiological time series
+            x_static : [B, num_static]   demographic features
+            x_mh     : [B, sum(vocab_k)] multi-hot sparse features
+            x_note   : [B, note_dim]     LLM note embedding
+            return_attn: if True, also return cross-attention weights [B, T, M]
+        """
+        import torch.nn.functional as F
+
+        # 1. LSTM encode sequence  → H [B, T, d]
+        H, _ = self.lstm(x_seq)
+
+        # 2. Project note → M virtual tokens [B, M, d]
+        if x_note is not None:
+            x_note_norm = F.normalize(x_note, p=2, dim=1)
+            note_tokens = self.note_proj(x_note_norm)          # [B, M*d]
+            note_tokens = note_tokens.view(
+                x_note.shape[0], self.M, self.hidden_dim       # [B, M, d]
+            )
+        else:
+            # fallback: zero note tokens (model still works without notes)
+            note_tokens = torch.zeros(
+                H.shape[0], self.M, self.hidden_dim, device=H.device
+            )
+
+        # 3. Cross-Attention  Q=H, K=V=note_tokens
+        attn_out, attn_weights = self.cross_attn(
+            query=H, key=note_tokens, value=note_tokens
+        )                                                        # [B, T, d]
+        H = self.cross_norm(H + attn_out)                       # residual
+        H = self.cross_ff_norm(H + self.cross_ff(H))            # FFN + residual
+
+        # 4. Temporal self-attention pooling  → seq_repr [B, d]
+        temp_w   = torch.softmax(self.temporal_attn(H).squeeze(-1), dim=1)  # [B, T]
+        seq_repr = (H * temp_w.unsqueeze(-1)).sum(dim=1)        # [B, d]
+
+        reprs = [seq_repr]
+
+        # 5. Demographics
+        if self.has_static and x_static is not None:
+            reprs.append(self._encode_static(x_static))
+
+        # 6. Sparse codes
+        if self.has_multihot and x_mh is not None:
+            reprs.append(self._encode_multihot(x_mh))
+
+        fused  = torch.cat(reprs, dim=1) if len(reprs) > 1 else reprs[0]
+        logits = self.classifier(fused).squeeze(-1)
+
+        if return_attn:
+            return logits, attn_weights   # attn_weights: [B, T, M]
+        return logits
+
 def train_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None, epochs=12, lr=1e-3, batch_size=256, pos_weight=None):
     """
     Train a PyTorch model with:
@@ -596,6 +779,18 @@ def main():
     torch.save(model_tf_notes.state_dict(), os.path.join(exp_dir, 'model_tf_notes.pt'))
     logging.info(f"Early Fusion Transformer model saved to {exp_dir}/model_tf_notes.pt")
     
+    logging.info("4. Training Cross-Modal Attention Fusion (LSTM × Note Cross-Attention)...")
+    model_cross = CrossModalAttnFusion(
+        seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims,
+        hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'],
+        nhead=4, num_virtual_tokens=4
+    )
+    model_cross = train_model(model_cross, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
+                              pos_weight=pos_weight_val)
+    auc_cross = evaluate_model(model_cross, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
+    torch.save(model_cross.state_dict(), os.path.join(exp_dir, 'model_cross_attn.pt'))
+    logging.info(f"Cross-Modal Attention model saved to {exp_dir}/model_cross_attn.pt")
+    
     # XGBoost natively handles class imbalance via scale_pos_weight (equivalent to pos_weight)
     X_xgb_base = flatten_features(X_seq, X_static, X_mh)
     xgb_base = xgb.XGBClassifier(n_estimators=200, max_depth=6,
@@ -623,6 +818,7 @@ def main():
     logging.info(f"LSTM LateFusion (+ LLM Notes):                 {auc_notes:.4f}")
     logging.info("-" * 55)
     logging.info(f"Transformer EarlyFusion (+ LLM Notes):         {auc_tf_notes:.4f}")
+    logging.info(f"CrossModal Attention Fusion (LSTM×Note):       {auc_cross:.4f}")
     logging.info("========================================================\n")
 
     # ── Write experiment_note.md ──────────────────────────────────────────────
@@ -679,20 +875,24 @@ def main():
 | LSTM Base         | Clinical seq (LSTM+Attn) + Static + ICD/DRG/Proc/Rx | {auc_base:.4f} |
 | LSTM Late Fusion  | Above + LLM note embeddings ({EXP_CONFIG['note_dim']}d) | {auc_notes:.4f} |
 | Transformer Early Fusion | All above (CLS token fusion) | {auc_tf_notes:.4f} |
+| **CrossModal Attn Fusion** | LSTM×Note cross-attn (M={EXP_CONFIG['note_dim']}d, 4 virtual tokens) | **{auc_cross:.4f}** |
 
 ### Note Embedding Impact
 - XGBoost: notes Δ AUC = {xgb_notes_auc - xgb_base_auc:+.4f}
-- LSTM:    notes Δ AUC = {auc_notes - auc_base:+.4f}
+- LSTM Late Fusion:       notes Δ AUC = {auc_notes - auc_base:+.4f}
+- CrossModal Attn Fusion: vs LSTM Base Δ AUC = {auc_cross - auc_base:+.4f}
+- CrossModal Attn Fusion: vs Transformer EF Δ AUC = {auc_cross - auc_tf_notes:+.4f}
 
 ## Saved Files
 | File | Description |
 |------|-------------|
-| `model_lstm_base.pt`  | Base LSTM state_dict |
-| `model_lstm_notes.pt` | Late Fusion LSTM state_dict |
-| `model_tf_notes.pt`   | Early Fusion Transformer state_dict |
-| `model_xgb_base.json` | XGBoost Base (XGBoost native format) |
-| `model_xgb_notes.json`| XGBoost + Notes (XGBoost native format) |
-| `seq_scaler.pkl`      | StandardScaler for sequence features (required for inference) |
+| `model_lstm_base.pt`   | Base LSTM state_dict |
+| `model_lstm_notes.pt`  | Late Fusion LSTM state_dict |
+| `model_tf_notes.pt`    | Early Fusion Transformer state_dict |
+| `model_cross_attn.pt`  | CrossModal Attention Fusion state_dict |
+| `model_xgb_base.json`  | XGBoost Base (XGBoost native format) |
+| `model_xgb_notes.json` | XGBoost + Notes (XGBoost native format) |
+| `seq_scaler.pkl`       | StandardScaler for sequence features (required for inference) |
 | `training.log`        | Full training log for this run |
 | `experiment_note.md`  | This file |
 """)
