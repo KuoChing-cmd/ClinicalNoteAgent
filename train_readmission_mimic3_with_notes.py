@@ -798,6 +798,7 @@ def main():
     logging.info("1. Training Base LSTM (Clinical Series + Demographics + ICD/DRG/Proc/Rx, NO Notes)...")
     model_base = LSTMLateFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, use_notes=False)
     model_base = train_model(model_base, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx],
+                             epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG['batch_size'],
                              pos_weight=pos_weight_val)
     auc_base = evaluate_model(model_base, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx])
     torch.save(model_base.state_dict(), os.path.join(exp_dir, 'model_lstm_base.pt'))
@@ -806,6 +807,7 @@ def main():
     logging.info("2. Training Late Fusion LSTM (Base + LLM Notes Embedding)...")
     model_notes = LSTMLateFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=4096, use_notes=True)
     model_notes = train_model(model_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
+                              epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG['batch_size'],
                               pos_weight=pos_weight_val)
     auc_notes = evaluate_model(model_notes, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
     torch.save(model_notes.state_dict(), os.path.join(exp_dir, 'model_lstm_notes.pt'))
@@ -814,6 +816,7 @@ def main():
     logging.info("3. Training Early Fusion Transformer (Base + LLM Notes Embedding)...")
     model_tf_notes = TransformerEarlyFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=4096, use_notes=True)
     model_tf_notes = train_model(model_tf_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
+                                 epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG['batch_size'],
                                  pos_weight=pos_weight_val)
     auc_tf_notes = evaluate_model(model_tf_notes, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
     torch.save(model_tf_notes.state_dict(), os.path.join(exp_dir, 'model_tf_notes.pt'))
@@ -826,6 +829,7 @@ def main():
         nhead=4, num_virtual_tokens=4
     )
     model_cross = train_model(model_cross, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
+                              epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG['batch_size'],
                               pos_weight=pos_weight_val)
     auc_cross = evaluate_model(model_cross, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
     torch.save(model_cross.state_dict(), os.path.join(exp_dir, 'model_cross_attn.pt'))
