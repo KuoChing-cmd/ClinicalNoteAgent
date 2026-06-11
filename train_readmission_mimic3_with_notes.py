@@ -491,8 +491,8 @@ def train_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None, epochs=1
         for batch in tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}"):
             x_s, y = batch[0], batch[1]
             x_st = batch[2] if X_static is not None else None
-            x_m = batch[3] if X_mh is not None else None
-            x_n = batch[4] if X_note is not None and len(batch) > 4 else None
+            x_m  = batch[3] if X_mh    is not None else None
+            x_n  = batch[4] if X_note  is not None else None  # Bug1 fix: len(batch) guard was unreliable
             
             optimizer.zero_grad()
             logits = model(x_s, x_st, x_m, x_n)
@@ -528,8 +528,8 @@ def evaluate_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None, batch
         for batch in loader:
             x_s = batch[0]
             x_st = batch[2] if X_static is not None else None
-            x_m = batch[3] if X_mh is not None else None
-            x_n = batch[4] if X_note is not None and len(batch) > 4 else None
+            x_m  = batch[3] if X_mh    is not None else None
+            x_n  = batch[4] if X_note  is not None else None  # Bug1 fix: len(batch) guard was unreliable
             
             preds = torch.sigmoid(model(x_s, x_st, x_m, x_n))
             all_preds.append(preds.cpu().numpy())
@@ -588,10 +588,46 @@ def fetch_mimic3_data(embeddings_dict):
         WHERE s.ICUSTAY_ID IN {tuple(stay_ids)}
     """).df()
     
-    np.random.seed(42)
-    stays_df['readmitted'] = np.random.binomial(1, 0.2, len(stays_df))
-    
-    stays_df['INTIME'] = pd.to_datetime(stays_df['INTIME'])
+    # Parse timestamps first, then compute ICU readmission labels.
+    # Two conditions (OR logic) define a positive label:
+    #   A. 跨次住院（Cross-admission）：同一 SUBJECT_ID 在本次出院后 30 天内
+    #      有另一次 ICU 入院（不同 HADM_ID）。
+    #   B. 院内再入ICU（Within-admission）：同一 HADM_ID 内存在另一次
+    #      INTIME > 本次 OUTTIME 的 ICU 住院。
+    stays_df['INTIME']  = pd.to_datetime(stays_df['INTIME'])
+    stays_df['OUTTIME'] = pd.to_datetime(stays_df['OUTTIME'])
+    stays_df = stays_df.sort_values(['SUBJECT_ID', 'INTIME']).reset_index(drop=True)
+
+    logging.info("Computing ICU readmission labels (30-day cross-admission OR within-admission)...")
+    readmitted_flags = []
+    source_a_count = 0
+    source_b_count = 0
+    for i, row in stays_df.iterrows():
+        # Condition A: 30天内跨次住院 ICU 再入院
+        cond_a = stays_df[
+            (stays_df['SUBJECT_ID'] == row['SUBJECT_ID']) &
+            (stays_df['HADM_ID']    != row['HADM_ID']) &
+            (stays_df['INTIME']      > row['OUTTIME']) &
+            (stays_df['INTIME']     <= row['OUTTIME'] + pd.Timedelta(days=30))
+        ]
+        # Condition B: 同一次住院（相同 HADM_ID）内的 ICU 再入院
+        cond_b = stays_df[
+            (stays_df['HADM_ID'] == row['HADM_ID']) &
+            (stays_df['INTIME']   > row['OUTTIME'])
+        ]
+        flag = 1 if (len(cond_a) > 0 or len(cond_b) > 0) else 0
+        readmitted_flags.append(flag)
+        if flag:
+            if len(cond_a) > 0: source_a_count += 1
+            if len(cond_b) > 0: source_b_count += 1
+    stays_df['readmitted'] = readmitted_flags
+    pos_rate = stays_df['readmitted'].mean()
+    logging.info(
+        f"ICU readmission rate: {pos_rate:.1%} "
+        f"({stays_df['readmitted'].sum()} / {len(stays_df)} stays) | "
+        f"Cross-admission(A): {source_a_count}, Within-admission(B): {source_b_count}"
+    )
+
     stays_df['DOB'] = pd.to_datetime(stays_df['DOB'], errors='coerce')
     stays_df['age'] = (stays_df['INTIME'] - stays_df['DOB']).dt.days / 365.25
     stays_df['age'] = stays_df['age'].clip(0, 100)
@@ -639,15 +675,18 @@ def fetch_mimic3_data(embeddings_dict):
         
         # Sequence
         evs = events_df[events_df['stay_id'] == sid].copy()
-        seq = np.zeros((48, 4), dtype=np.float32)
+        # Bug3 fix: initialize with NaN so that un-observed slots are truly missing,
+        # and real zero-valued measurements are NOT incorrectly treated as absent.
+        seq = np.full((48, 4), np.nan, dtype=np.float32)
         if not evs.empty:
             evs['CHARTTIME'] = pd.to_datetime(evs['CHARTTIME'])
             evs['hour'] = ((evs['CHARTTIME'] - stay['INTIME']).dt.total_seconds() / 3600).astype(int)
             evs = evs[(evs['hour'] >= 0) & (evs['hour'] < 48)]
             for _, e in evs.iterrows():
                 seq[int(e['hour']), item_map[e['ITEMID']]] = e['VALUENUM']
-                
-        df_seq = pd.DataFrame(seq).replace(0.0, np.nan).ffill().fillna(0.0)
+
+        # ffill: carry last observed value forward; fill remaining leading NaNs with 0
+        df_seq = pd.DataFrame(seq).ffill().fillna(0.0)
         X_seq.append(df_seq.values)
         
         # Static
@@ -730,6 +769,7 @@ def main():
     ordered_static_dims = {'age': 0, 'GENDER': static_dims['GENDER'], 'MARITAL_STATUS': static_dims['MARITAL_STATUS'], 
                            'ETHNICITY': static_dims['ETHNICITY'], 'INSURANCE': static_dims['INSURANCE']}
                            
+    np.random.seed(42)  # Bug4 fix: set seed for reproducible train/test split
     idx = np.random.permutation(len(Y))
     ts = int(0.8 * len(Y))
     train_idx, test_idx = idx[:ts], idx[ts:]
