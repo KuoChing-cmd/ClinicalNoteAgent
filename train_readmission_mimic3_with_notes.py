@@ -1,6 +1,7 @@
 import os
 import pickle
 import logging
+from datetime import datetime
 
 os.makedirs('output', exist_ok=True)
 logging.basicConfig(
@@ -489,10 +490,53 @@ def fetch_mimic3_data(embeddings_dict):
 def flatten_features(X_seq, X_static, X_mh):
     return np.concatenate([np.mean(X_seq, axis=1), X_seq[:, -1, :], X_static, X_mh], axis=1)
 
+# ─── Experiment Configuration ────────────────────────────────────────────────
+# Edit these values to configure a run. The exp dir name is auto-generated.
+EXP_CONFIG = {
+    "epochs":      100,
+    "lr":          1e-3,
+    "batch_size":  256,
+    "hidden_dim":  64,
+    "note_dim":    4096,
+    "top_k_codes": 64,          # top-K for ICD/DRG/Proc/Rx multi-hot
+    "xgb_n_est":   200,
+    "xgb_depth":   6,
+    # Optimizations enabled in this run
+    "opt_seq_norm":    True,     # ① StandardScaler on sequence features
+    "opt_cosine_lr":   True,     # ② CosineAnnealingLR scheduler
+    "opt_pos_weight":  True,     # ③ pos_weight for class imbalance
+}
+
+def make_exp_dir() -> str:
+    """Create a timestamped, parameter-tagged experiment output directory."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    lr_str = f"lr{EXP_CONFIG['lr']:.0e}".replace('-', 'm')   # e.g. lr1e-3 -> lr1em3
+    tag = (
+        f"ep{EXP_CONFIG['epochs']}"
+        f"_{lr_str}"
+        f"_hd{EXP_CONFIG['hidden_dim']}"
+        f"_bs{EXP_CONFIG['batch_size']}"
+        f"{'_seqnorm' if EXP_CONFIG['opt_seq_norm'] else ''}"
+        f"{'_cosinelr' if EXP_CONFIG['opt_cosine_lr'] else ''}"
+        f"{'_posw' if EXP_CONFIG['opt_pos_weight'] else ''}"
+    )
+    exp_dir = os.path.join('output', f"{ts}_{tag}")
+    os.makedirs(exp_dir, exist_ok=True)
+    return exp_dir
+
 def main():
     if not os.path.exists('output/mimic3_note_embeddings.pkl'):
         logging.error("Embeddings file not found! Please run preprocess_note_embeddings.py first.")
         return
+    
+    # Create the experiment directory for this run
+    exp_dir = make_exp_dir()
+    run_start = datetime.now()
+    logging.info(f"Experiment directory: {exp_dir}")
+    # Add a per-experiment log handler
+    exp_log_handler = logging.FileHandler(os.path.join(exp_dir, 'training.log'))
+    exp_log_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+    logging.getLogger().addHandler(exp_log_handler)
         
     with open('output/mimic3_note_embeddings.pkl', 'rb') as f:
         embeddings_dict = pickle.load(f)
@@ -516,8 +560,8 @@ def main():
     X_seq_train_flat = X_seq[train_idx].reshape(-1, F)
     seq_scaler.fit(X_seq_train_flat)
     X_seq = seq_scaler.transform(X_seq.reshape(-1, F)).reshape(X_seq.shape[0], T, F).astype(np.float32)
-    pickle.dump(seq_scaler, open('output/seq_scaler.pkl', 'wb'))
-    logging.info("Sequence scaler saved to output/seq_scaler.pkl")
+    pickle.dump(seq_scaler, open(os.path.join(exp_dir, 'seq_scaler.pkl'), 'wb'))
+    logging.info(f"Sequence scaler saved to {exp_dir}/seq_scaler.pkl")
     
     # ── Optimization ③: Compute pos_weight from training labels ──────────────
     Y_train = Y[train_idx]
@@ -533,24 +577,24 @@ def main():
     model_base = train_model(model_base, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx],
                              pos_weight=pos_weight_val)
     auc_base = evaluate_model(model_base, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx])
-    torch.save(model_base.state_dict(), 'output/model_lstm_base.pt')
-    logging.info("Base LSTM model saved to output/model_lstm_base.pt")
+    torch.save(model_base.state_dict(), os.path.join(exp_dir, 'model_lstm_base.pt'))
+    logging.info(f"Base LSTM model saved to {exp_dir}/model_lstm_base.pt")
     
     logging.info("2. Training Late Fusion LSTM (Base + LLM Notes Embedding)...")
     model_notes = LSTMLateFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=4096, use_notes=True)
     model_notes = train_model(model_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
                               pos_weight=pos_weight_val)
     auc_notes = evaluate_model(model_notes, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
-    torch.save(model_notes.state_dict(), 'output/model_lstm_notes.pt')
-    logging.info("Late Fusion LSTM model saved to output/model_lstm_notes.pt")
+    torch.save(model_notes.state_dict(), os.path.join(exp_dir, 'model_lstm_notes.pt'))
+    logging.info(f"Late Fusion LSTM model saved to {exp_dir}/model_lstm_notes.pt")
     
     logging.info("3. Training Early Fusion Transformer (Base + LLM Notes Embedding)...")
     model_tf_notes = TransformerEarlyFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=4096, use_notes=True)
     model_tf_notes = train_model(model_tf_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
                                  pos_weight=pos_weight_val)
     auc_tf_notes = evaluate_model(model_tf_notes, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
-    torch.save(model_tf_notes.state_dict(), 'output/model_tf_notes.pt')
-    logging.info("Early Fusion Transformer model saved to output/model_tf_notes.pt")
+    torch.save(model_tf_notes.state_dict(), os.path.join(exp_dir, 'model_tf_notes.pt'))
+    logging.info(f"Early Fusion Transformer model saved to {exp_dir}/model_tf_notes.pt")
     
     # XGBoost natively handles class imbalance via scale_pos_weight (equivalent to pos_weight)
     X_xgb_base = flatten_features(X_seq, X_static, X_mh)
@@ -559,8 +603,8 @@ def main():
                                    tree_method='hist', device='cuda')
     xgb_base.fit(X_xgb_base[train_idx], Y[train_idx])
     xgb_base_auc = roc_auc_score(Y[test_idx], xgb_base.predict_proba(X_xgb_base[test_idx])[:, 1])
-    xgb_base.save_model('output/model_xgb_base.json')
-    logging.info("XGBoost Base model saved to output/model_xgb_base.json")
+    xgb_base.save_model(os.path.join(exp_dir, 'model_xgb_base.json'))
+    logging.info(f"XGBoost Base model saved to {exp_dir}/model_xgb_base.json")
     
     X_xgb_notes = np.concatenate([X_xgb_base, X_note], axis=1)
     xgb_notes = xgb.XGBClassifier(n_estimators=200, max_depth=6,
@@ -568,8 +612,8 @@ def main():
                                     tree_method='hist', device='cuda')
     xgb_notes.fit(X_xgb_notes[train_idx], Y[train_idx])
     xgb_notes_auc = roc_auc_score(Y[test_idx], xgb_notes.predict_proba(X_xgb_notes[test_idx])[:, 1])
-    xgb_notes.save_model('output/model_xgb_notes.json')
-    logging.info("XGBoost + LLM Notes model saved to output/model_xgb_notes.json")
+    xgb_notes.save_model(os.path.join(exp_dir, 'model_xgb_notes.json'))
+    logging.info(f"XGBoost + LLM Notes model saved to {exp_dir}/model_xgb_notes.json")
 
     logging.info("\n================ FINAL ABLATION RESULTS ================")
     logging.info(f"XGBoost Base (Clinical + Static + Sparse):     {xgb_base_auc:.4f}")
@@ -580,6 +624,80 @@ def main():
     logging.info("-" * 55)
     logging.info(f"Transformer EarlyFusion (+ LLM Notes):         {auc_tf_notes:.4f}")
     logging.info("========================================================\n")
+
+    # ── Write experiment_note.md ──────────────────────────────────────────────
+    run_end = datetime.now()
+    duration = run_end - run_start
+    h, rem = divmod(int(duration.total_seconds()), 3600)
+    m, s = divmod(rem, 60)
+    duration_str = f"{h}h {m}m {s}s"
+
+    note_path = os.path.join(exp_dir, 'experiment_note.md')
+    with open(note_path, 'w') as f:
+        f.write(f"""# Experiment Note
+
+## Run Info
+| Item | Value |
+|------|-------|
+| Timestamp | {run_start.strftime('%Y-%m-%d %H:%M:%S')} |
+| Duration  | {duration_str} |
+| Exp Dir   | `{exp_dir}` |
+
+## Dataset
+| Item | Value |
+|------|-------|
+| Total samples  | {len(Y)} |
+| Train / Test   | {len(train_idx)} / {len(test_idx)} |
+| Positives (train) | {int(n_pos)} ({100*n_pos/len(Y_train):.1f}%) |
+| Negatives (train) | {int(n_neg)} ({100*n_neg/len(Y_train):.1f}%) |
+| pos_weight applied | {pos_weight_val:.2f} |
+
+## Model Hyperparameters
+| Param | Value |
+|-------|-------|
+| epochs     | {EXP_CONFIG['epochs']} |
+| lr         | {EXP_CONFIG['lr']} |
+| batch_size | {EXP_CONFIG['batch_size']} |
+| hidden_dim | {EXP_CONFIG['hidden_dim']} |
+| note_dim   | {EXP_CONFIG['note_dim']} |
+| top_k_codes | {EXP_CONFIG['top_k_codes']} |
+| xgb_n_estimators | {EXP_CONFIG['xgb_n_est']} |
+| xgb_max_depth    | {EXP_CONFIG['xgb_depth']} |
+
+## Optimizations Applied
+| # | Optimization | Enabled |
+|---|---|---|
+| ① | Sequence StandardScaler (fit on train only) | {'✅' if EXP_CONFIG['opt_seq_norm'] else '❌'} |
+| ② | CosineAnnealingLR scheduler (eta_min = lr×0.01) | {'✅' if EXP_CONFIG['opt_cosine_lr'] else '❌'} |
+| ③ | BCEWithLogitsLoss pos_weight / XGB scale_pos_weight | {'✅' if EXP_CONFIG['opt_pos_weight'] else '❌'} |
+
+## Ablation Study Results (Test ROC-AUC)
+| Model | Features | AUC |
+|-------|----------|-----|
+| XGBoost Base      | Clinical seq (mean+last) + Static + ICD/DRG/Proc/Rx | {xgb_base_auc:.4f} |
+| XGBoost + LLM Notes | Above + LLM note embeddings ({EXP_CONFIG['note_dim']}d) | {xgb_notes_auc:.4f} |
+| LSTM Base         | Clinical seq (LSTM+Attn) + Static + ICD/DRG/Proc/Rx | {auc_base:.4f} |
+| LSTM Late Fusion  | Above + LLM note embeddings ({EXP_CONFIG['note_dim']}d) | {auc_notes:.4f} |
+| Transformer Early Fusion | All above (CLS token fusion) | {auc_tf_notes:.4f} |
+
+### Note Embedding Impact
+- XGBoost: notes Δ AUC = {xgb_notes_auc - xgb_base_auc:+.4f}
+- LSTM:    notes Δ AUC = {auc_notes - auc_base:+.4f}
+
+## Saved Files
+| File | Description |
+|------|-------------|
+| `model_lstm_base.pt`  | Base LSTM state_dict |
+| `model_lstm_notes.pt` | Late Fusion LSTM state_dict |
+| `model_tf_notes.pt`   | Early Fusion Transformer state_dict |
+| `model_xgb_base.json` | XGBoost Base (XGBoost native format) |
+| `model_xgb_notes.json`| XGBoost + Notes (XGBoost native format) |
+| `seq_scaler.pkl`      | StandardScaler for sequence features (required for inference) |
+| `training.log`        | Full training log for this run |
+| `experiment_note.md`  | This file |
+""")
+    logging.info(f"Experiment note written to {note_path}")
+    logging.getLogger().removeHandler(exp_log_handler)
 
 if __name__ == "__main__":
     main()
