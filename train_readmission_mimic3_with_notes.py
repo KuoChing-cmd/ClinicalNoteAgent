@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from tqdm import tqdm
 import xgboost as xgb
 import math
@@ -268,55 +268,90 @@ class TransformerEarlyFusionWithNotes(nn.Module):
         cls_out = out[:, 0, :]
         return self.classifier(cls_out).squeeze(-1)
 
-def train_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None, epochs=12, lr=1e-3):
+def train_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None, epochs=12, lr=1e-3, batch_size=256, pos_weight=None):
+    """
+    Train a PyTorch model with:
+      - Optimization ②: CosineAnnealingLR learning rate scheduling
+      - Optimization ③: pos_weight in BCEWithLogitsLoss to handle class imbalance
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
+    logging.info(f"Using device: {device} for training")
     
-    tensors = [torch.tensor(X_seq, dtype=torch.float32), torch.tensor(Y, dtype=torch.float32)]
+    tensors = [torch.tensor(X_seq, dtype=torch.float32).to(device), torch.tensor(Y, dtype=torch.float32).to(device)]
     
-    if X_static is not None: tensors.append(torch.tensor(X_static, dtype=torch.float32))
-    else: tensors.append(torch.zeros(len(Y), 1))
+    if X_static is not None: tensors.append(torch.tensor(X_static, dtype=torch.float32).to(device))
+    else: tensors.append(torch.zeros(len(Y), 1).to(device))
         
-    if X_mh is not None: tensors.append(torch.tensor(X_mh, dtype=torch.float32))
-    else: tensors.append(torch.zeros(len(Y), 1))
+    if X_mh is not None: tensors.append(torch.tensor(X_mh, dtype=torch.float32).to(device))
+    else: tensors.append(torch.zeros(len(Y), 1).to(device))
 
-    if X_note is not None: tensors.append(torch.tensor(X_note, dtype=torch.float32))
+    if X_note is not None: tensors.append(torch.tensor(X_note, dtype=torch.float32).to(device))
         
     dataset = TensorDataset(*tensors)
-    loader = DataLoader(dataset, batch_size=64, shuffle=True)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
-    criterion = nn.BCEWithLogitsLoss()
+    # Optimization ③: class-imbalance-aware loss
+    pw = torch.tensor([pos_weight], dtype=torch.float32).to(device) if pos_weight is not None else None
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
+    if pos_weight is not None:
+        logging.info(f"  pos_weight = {pos_weight:.2f} (neg/pos ratio, correcting class imbalance)")
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # Optimization ②: cosine annealing LR — starts at lr, decays smoothly to 0
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
     
     for epoch in range(epochs):
         model.train()
-        for batch in loader:
-            x_s, y = batch[0].to(device), batch[1].to(device)
-            x_st = batch[2].to(device) if X_static is not None else None
-            x_m = batch[3].to(device) if X_mh is not None else None
-            x_n = batch[4].to(device) if X_note is not None and len(batch) > 4 else None
+        epoch_loss = 0.0
+        for batch in tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            x_s, y = batch[0], batch[1]
+            x_st = batch[2] if X_static is not None else None
+            x_m = batch[3] if X_mh is not None else None
+            x_n = batch[4] if X_note is not None and len(batch) > 4 else None
             
             optimizer.zero_grad()
             logits = model(x_s, x_st, x_m, x_n)
             loss = criterion(logits, y)
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
+        
+        scheduler.step()    
+        logging.info(f"Epoch {epoch+1}/{epochs} completed - Loss: {epoch_loss/len(loader):.4f}  LR: {scheduler.get_last_lr()[0]:.2e}")
             
     return model
 
-def evaluate_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None):
+def evaluate_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None, batch_size=512):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.eval()
     
+    tensors = [torch.tensor(X_seq, dtype=torch.float32).to(device), torch.tensor(Y, dtype=torch.float32).to(device)]
+    
+    if X_static is not None: tensors.append(torch.tensor(X_static, dtype=torch.float32).to(device))
+    else: tensors.append(torch.zeros(len(Y), 1).to(device))
+        
+    if X_mh is not None: tensors.append(torch.tensor(X_mh, dtype=torch.float32).to(device))
+    else: tensors.append(torch.zeros(len(Y), 1).to(device))
+
+    if X_note is not None: tensors.append(torch.tensor(X_note, dtype=torch.float32).to(device))
+        
+    dataset = TensorDataset(*tensors)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    
+    all_preds = []
     with torch.no_grad():
-        x_s = torch.tensor(X_seq, dtype=torch.float32).to(device)
-        x_st = torch.tensor(X_static, dtype=torch.float32).to(device) if X_static is not None else None
-        x_m = torch.tensor(X_mh, dtype=torch.float32).to(device) if X_mh is not None else None
-        x_n = torch.tensor(X_note, dtype=torch.float32).to(device) if X_note is not None else None
-        
-        preds = torch.sigmoid(model(x_s, x_st, x_m, x_n)).cpu().numpy()
-        
-    return roc_auc_score(Y, preds)
+        for batch in loader:
+            x_s = batch[0]
+            x_st = batch[2] if X_static is not None else None
+            x_m = batch[3] if X_mh is not None else None
+            x_n = batch[4] if X_note is not None and len(batch) > 4 else None
+            
+            preds = torch.sigmoid(model(x_s, x_st, x_m, x_n))
+            all_preds.append(preds.cpu().numpy())
+            
+    all_preds = np.concatenate(all_preds)
+    return roc_auc_score(Y, all_preds)
 
 # ---------------------------------------------------------
 # Data Processing Pipeline (MIMIC-III DuckDB)
@@ -472,32 +507,69 @@ def main():
     ts = int(0.8 * len(Y))
     train_idx, test_idx = idx[:ts], idx[ts:]
     
+    # ── Optimization ①: Sequence Feature Normalization ────────────────────────
+    # Fit StandardScaler ONLY on train split to prevent data leakage.
+    # Reshape (N, T, F) -> (N*T, F) for fitting, then reshape back.
+    logging.info("Applying StandardScaler to sequence features (fit on train only)...")
+    N_train, T, F = X_seq[train_idx].shape
+    seq_scaler = StandardScaler()
+    X_seq_train_flat = X_seq[train_idx].reshape(-1, F)
+    seq_scaler.fit(X_seq_train_flat)
+    X_seq = seq_scaler.transform(X_seq.reshape(-1, F)).reshape(X_seq.shape[0], T, F).astype(np.float32)
+    pickle.dump(seq_scaler, open('output/seq_scaler.pkl', 'wb'))
+    logging.info("Sequence scaler saved to output/seq_scaler.pkl")
+    
+    # ── Optimization ③: Compute pos_weight from training labels ──────────────
+    Y_train = Y[train_idx]
+    n_pos = Y_train.sum()
+    n_neg = len(Y_train) - n_pos
+    pos_weight_val = float(n_neg / n_pos) if n_pos > 0 else 1.0
+    logging.info(f"Class distribution — positives: {int(n_pos)}, negatives: {int(n_neg)}, pos_weight: {pos_weight_val:.2f}")
+    
     logging.info("\n================ ABLATION STUDY: CLINICAL ALIGNMENT ================")
     
     logging.info("1. Training Base LSTM (Clinical Series + Demographics + ICD/DRG/Proc/Rx, NO Notes)...")
     model_base = LSTMLateFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, use_notes=False)
-    model_base = train_model(model_base, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx])
+    model_base = train_model(model_base, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx],
+                             pos_weight=pos_weight_val)
     auc_base = evaluate_model(model_base, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx])
+    torch.save(model_base.state_dict(), 'output/model_lstm_base.pt')
+    logging.info("Base LSTM model saved to output/model_lstm_base.pt")
     
     logging.info("2. Training Late Fusion LSTM (Base + LLM Notes Embedding)...")
     model_notes = LSTMLateFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=4096, use_notes=True)
-    model_notes = train_model(model_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx])
+    model_notes = train_model(model_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
+                              pos_weight=pos_weight_val)
     auc_notes = evaluate_model(model_notes, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
+    torch.save(model_notes.state_dict(), 'output/model_lstm_notes.pt')
+    logging.info("Late Fusion LSTM model saved to output/model_lstm_notes.pt")
     
     logging.info("3. Training Early Fusion Transformer (Base + LLM Notes Embedding)...")
     model_tf_notes = TransformerEarlyFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=4096, use_notes=True)
-    model_tf_notes = train_model(model_tf_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx])
+    model_tf_notes = train_model(model_tf_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
+                                 pos_weight=pos_weight_val)
     auc_tf_notes = evaluate_model(model_tf_notes, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
+    torch.save(model_tf_notes.state_dict(), 'output/model_tf_notes.pt')
+    logging.info("Early Fusion Transformer model saved to output/model_tf_notes.pt")
     
+    # XGBoost natively handles class imbalance via scale_pos_weight (equivalent to pos_weight)
     X_xgb_base = flatten_features(X_seq, X_static, X_mh)
-    xgb_base = xgb.XGBClassifier(n_estimators=50, max_depth=4)
+    xgb_base = xgb.XGBClassifier(n_estimators=200, max_depth=6,
+                                   scale_pos_weight=pos_weight_val,
+                                   tree_method='hist', device='cuda')
     xgb_base.fit(X_xgb_base[train_idx], Y[train_idx])
     xgb_base_auc = roc_auc_score(Y[test_idx], xgb_base.predict_proba(X_xgb_base[test_idx])[:, 1])
+    xgb_base.save_model('output/model_xgb_base.json')
+    logging.info("XGBoost Base model saved to output/model_xgb_base.json")
     
     X_xgb_notes = np.concatenate([X_xgb_base, X_note], axis=1)
-    xgb_notes = xgb.XGBClassifier(n_estimators=50, max_depth=4)
+    xgb_notes = xgb.XGBClassifier(n_estimators=200, max_depth=6,
+                                    scale_pos_weight=pos_weight_val,
+                                    tree_method='hist', device='cuda')
     xgb_notes.fit(X_xgb_notes[train_idx], Y[train_idx])
     xgb_notes_auc = roc_auc_score(Y[test_idx], xgb_notes.predict_proba(X_xgb_notes[test_idx])[:, 1])
+    xgb_notes.save_model('output/model_xgb_notes.json')
+    logging.info("XGBoost + LLM Notes model saved to output/model_xgb_notes.json")
 
     logging.info("\n================ FINAL ABLATION RESULTS ================")
     logging.info(f"XGBoost Base (Clinical + Static + Sparse):     {xgb_base_auc:.4f}")
