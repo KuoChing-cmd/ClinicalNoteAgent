@@ -1249,7 +1249,13 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     multihot_dims = {'icd': icd_dim, 'drg': drg_dim, 'proc': proc_dim, 'rx': rx_dim}
 
     # 3. Dynamic Sequence Features
-    item_map = {211: 0, 220045: 0, 618: 1, 220210: 1, 646: 2, 220277: 2, 51: 3, 220050: 3}
+    item_map = {
+        211: 0, 220045: 0, 618: 1, 220210: 1, 646: 2, 220277: 2, 51: 3, 220050: 3,
+        8368: 4, 220051: 4,               # Diastolic BP
+        52: 5, 220052: 5, 225312: 5,      # MAP
+        678: 6, 223761: 6, 676: 6, 223762: 6, # Temperature
+        807: 7, 811: 7, 1529: 7, 225664: 7, 220621: 7 # Glucose
+    }
     logging.info(f"Querying CHARTEVENTS for sequences...")
     events_df = con.query(f"""
         SELECT ICUSTAY_ID as stay_id, CHARTTIME, ITEMID, VALUENUM
@@ -1268,7 +1274,7 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
         evs = events_df[events_df['stay_id'] == sid].copy()
         # Bug3 fix: initialize with NaN so that un-observed slots are truly missing,
         # and real zero-valued measurements are NOT incorrectly treated as absent.
-        seq = np.full((48, 4), np.nan, dtype=np.float32)
+        seq = np.full((48, 8), np.nan, dtype=np.float32)
         if not evs.empty:
             evs['CHARTTIME'] = pd.to_datetime(evs['CHARTTIME'])
             evs['hour'] = ((evs['CHARTTIME'] - stay['INTIME']).dt.total_seconds() / 3600).astype(int)
@@ -1383,8 +1389,8 @@ def main():
     # ── Dataset cache: skip 17-min DuckDB pipeline on repeat runs ─────────────
     # Cache is per embedding type to avoid conflicts
     cache_tag = f'_{emb_type}' if emb_type != 'llama' else ''
-    cache_npz = f'output/dataset_cache{cache_tag}.npz'
-    cache_meta = f'output/dataset_cache{cache_tag}_meta.pkl'
+    cache_npz = f'output/dataset_cache{cache_tag}_8dim.npz'
+    cache_meta = f'output/dataset_cache{cache_tag}_meta_8dim.pkl'
     
     if os.path.exists(cache_npz) and os.path.exists(cache_meta):
         logging.info(f"Loading cached dataset from {cache_npz} ...")
@@ -1458,7 +1464,7 @@ def main():
     logging.info("\n================ ABLATION STUDY: CLINICAL ALIGNMENT ================")
     
     logging.info("1. Training Base LSTM (Clinical Series + Demographics + ICD/DRG/Proc/Rx, NO Notes)...")
-    model_base = LSTMLateFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, use_notes=False)
+    model_base = LSTMLateFusionWithNotes(seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims, use_notes=False)
     model_base, hist_base = train_model(
         model_base, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx],
@@ -1471,7 +1477,7 @@ def main():
     logging.info(f"Base LSTM model saved to {exp_dir}/model_lstm_base.pt")
     
     logging.info("2. Training Late Fusion LSTM (Base + LLM Notes Embedding)...")
-    model_notes = LSTMLateFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True)
+    model_notes = LSTMLateFusionWithNotes(seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True)
     model_notes, hist_notes = train_model(
         model_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
@@ -1484,7 +1490,7 @@ def main():
     logging.info(f"Late Fusion LSTM model saved to {exp_dir}/model_lstm_notes.pt")
     
     logging.info("3. Training Early Fusion Transformer (Base + LLM Notes Embedding)...")
-    model_tf_notes = TransformerEarlyFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True)
+    model_tf_notes = TransformerEarlyFusionWithNotes(seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True)
     model_tf_notes, hist_tf = train_model(
         model_tf_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
@@ -1498,7 +1504,7 @@ def main():
     
     logging.info("4. Training Cross-Modal Attention Fusion (LSTM × Note Cross-Attention)...")
     model_cross = CrossModalAttnFusion(
-        seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims,
+        seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims,
         hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'],
         nhead=4, num_virtual_tokens=4
     )
@@ -1515,7 +1521,7 @@ def main():
     
     logging.info("5. Training Gated Fusion (LSTM × Note Gated Blend)...")
     model_gated = GatedFusionWithNotes(
-        seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims,
+        seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims,
         hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'],
     )
     model_gated, hist_gated = train_model(
@@ -1531,9 +1537,9 @@ def main():
     
     logging.info("6. Training Pretrained Transformer + Cross-Modal Attention...")
     # 1. Pretrain the encoder
-    pretrained_encoder = TransformerSeqEncoder(seq_input_dim=4, hidden_dim=EXP_CONFIG['hidden_dim'], num_layers=2)
+    pretrained_encoder = TransformerSeqEncoder(seq_input_dim=8, hidden_dim=EXP_CONFIG['hidden_dim'], num_layers=2)
     pretrained_encoder = pretrain_transformer(
-        pretrained_encoder, X_seq[train_idx], seq_dim=4, hidden_dim=EXP_CONFIG['hidden_dim'],
+        pretrained_encoder, X_seq[train_idx], seq_dim=8, hidden_dim=EXP_CONFIG['hidden_dim'],
         epochs=10, lr=1e-3, batch_size=EXP_CONFIG['batch_size'], mask_prob=0.15
     )
     
