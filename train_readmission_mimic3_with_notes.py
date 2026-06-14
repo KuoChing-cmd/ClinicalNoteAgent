@@ -1423,6 +1423,7 @@ EXP_CONFIG = {
     "lr":          1e-3,
     "batch_size":  256,
     "hidden_dim":  64,
+    "tf_num_layers": 4,          # Increased from 2 to 4 to improve performance
     "note_dim":    None,         # auto-detected from embeddings (768 for ClinicalBERT, 4096 for Llama)
     "top_k_codes": 64,           # top-K for ICD/DRG/Proc/Rx multi-hot
     "xgb_n_est":   200,
@@ -1595,7 +1596,7 @@ def main():
     logging.info(f"Late Fusion LSTM model saved to {exp_dir}/model_lstm_notes.pt")
     
     logging.info("3. Training Early Fusion Transformer (Base + LLM Notes Embedding)...")
-    model_tf_notes = TransformerEarlyFusionWithNotes(seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True)
+    model_tf_notes = TransformerEarlyFusionWithNotes(seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True, num_layers=EXP_CONFIG['tf_num_layers'])
     model_tf_notes, hist_tf = train_model(
         model_tf_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
@@ -1642,7 +1643,7 @@ def main():
     
     logging.info("6. Training Pretrained Transformer + Cross-Modal Attention...")
     # 1. Pretrain the encoder
-    pretrained_encoder = TransformerSeqEncoder(seq_input_dim=8, hidden_dim=EXP_CONFIG['hidden_dim'], num_layers=2)
+    pretrained_encoder = TransformerSeqEncoder(seq_input_dim=8, hidden_dim=EXP_CONFIG['hidden_dim'], num_layers=EXP_CONFIG['tf_num_layers'])
     pretrained_encoder = pretrain_transformer(
         pretrained_encoder, X_seq[train_idx], seq_dim=8, hidden_dim=EXP_CONFIG['hidden_dim'],
         epochs=10, lr=1e-3, batch_size=EXP_CONFIG['batch_size'], mask_prob=0.15
