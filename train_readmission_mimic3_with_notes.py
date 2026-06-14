@@ -67,6 +67,11 @@ class LSTMLateFusionWithNotes(nn.Module):
         # 3. High-Dim Sparse Features (ICD, DRG, etc.)
         self.has_multihot = len(self.multihot_dims) > 0
         if self.has_multihot:
+            if getattr(self, 'use_notes', True) and getattr(self, 'note_dim', None) is not None:
+                self.note_to_mh_queries = nn.ModuleDict()
+                for name, vocab_size in self.multihot_dims.items():
+                    emb_dim = max(8, min(32, vocab_size // 4))
+                    self.note_to_mh_queries[name] = nn.Linear(self.note_dim, emb_dim)
             self.mh_emb_dict = nn.ModuleDict()
             mh_repr_dim = 0
             for name, vocab_size in self.multihot_dims.items():
@@ -78,6 +83,7 @@ class LSTMLateFusionWithNotes(nn.Module):
                 nn.Linear(mh_repr_dim, 32),
                 nn.ReLU()
             )
+
             fused_dim += 32
 
         # 4. Note processing
@@ -100,10 +106,20 @@ class LSTMLateFusionWithNotes(nn.Module):
             nn.Linear(32, 1)
         )
 
-    def _multihot_to_embedding(self, x_group: torch.Tensor, emb: nn.Embedding) -> torch.Tensor:
-        summed = x_group @ emb.weight
-        denom = torch.clamp(x_group.sum(dim=1, keepdim=True), min=1.0)
-        return summed / denom
+    def _multihot_to_embedding(self, x_group, emb, query_proj=None, x_note=None):
+        import torch
+        import torch.nn.functional as F
+        if x_note is not None and query_proj is not None:
+            query = query_proj(x_note)
+            scores = query @ emb.weight.T
+            scores = scores.masked_fill(x_group == 0, -1e9)
+            attn = F.softmax(scores, dim=1)
+            has_codes = (x_group.sum(dim=1, keepdim=True) > 0).float()
+            return (attn @ emb.weight) * has_codes
+        else:
+            summed = x_group @ emb.weight
+            denom  = torch.clamp(x_group.sum(dim=1, keepdim=True), min=1.0)
+            return summed / denom
         
     def forward(self, x_seq, x_static=None, x_mh=None, x_note=None):
         out, _ = self.lstm(x_seq)
@@ -129,7 +145,8 @@ class LSTMLateFusionWithNotes(nn.Module):
             col_offset = 0
             for name, vocab_size in self.multihot_dims.items():
                 group = x_mh[:, col_offset : col_offset + vocab_size]
-                mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name]))
+                query_proj = getattr(self, 'note_to_mh_queries', {}).get(name, None)
+                mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name], query_proj, x_note))
                 col_offset += vocab_size
             reprs.append(self.mh_head(torch.cat(mh_embs, dim=1)))
             
@@ -193,6 +210,11 @@ class TransformerEarlyFusionWithNotes(nn.Module):
         # 3. High-Dim Sparse Features (ICD, DRG, etc.)
         self.has_multihot = len(self.multihot_dims) > 0
         if self.has_multihot:
+            if getattr(self, 'use_notes', True) and getattr(self, 'note_dim', None) is not None:
+                self.note_to_mh_queries = nn.ModuleDict()
+                for name, vocab_size in self.multihot_dims.items():
+                    emb_dim = max(8, min(32, vocab_size // 4))
+                    self.note_to_mh_queries[name] = nn.Linear(self.note_dim, emb_dim)
             self.mh_emb_dict = nn.ModuleDict()
             mh_repr_dim = 0
             for name, vocab_size in self.multihot_dims.items():
@@ -209,6 +231,7 @@ class TransformerEarlyFusionWithNotes(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(0.3)
             )
+
             
         # 5. Final Classification Head
         self.classifier = nn.Sequential(
@@ -220,10 +243,20 @@ class TransformerEarlyFusionWithNotes(nn.Module):
             nn.Linear(32, 1)
         )
 
-    def _multihot_to_embedding(self, x_group: torch.Tensor, emb: nn.Embedding) -> torch.Tensor:
-        summed = x_group @ emb.weight
-        denom = torch.clamp(x_group.sum(dim=1, keepdim=True), min=1.0)
-        return summed / denom
+    def _multihot_to_embedding(self, x_group, emb, query_proj=None, x_note=None):
+        import torch
+        import torch.nn.functional as F
+        if x_note is not None and query_proj is not None:
+            query = query_proj(x_note)
+            scores = query @ emb.weight.T
+            scores = scores.masked_fill(x_group == 0, -1e9)
+            attn = F.softmax(scores, dim=1)
+            has_codes = (x_group.sum(dim=1, keepdim=True) > 0).float()
+            return (attn @ emb.weight) * has_codes
+        else:
+            summed = x_group @ emb.weight
+            denom  = torch.clamp(x_group.sum(dim=1, keepdim=True), min=1.0)
+            return summed / denom
         
     def forward(self, x_seq, x_static=None, x_mh=None, x_note=None):
         B = x_seq.shape[0]
@@ -249,7 +282,8 @@ class TransformerEarlyFusionWithNotes(nn.Module):
             col_offset = 0
             for name, vocab_size in self.multihot_dims.items():
                 group = x_mh[:, col_offset : col_offset + vocab_size]
-                mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name]))
+                query_proj = getattr(self, 'note_to_mh_queries', {}).get(name, None)
+                mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name], query_proj, x_note))
                 col_offset += vocab_size
             mh_repr = self.mh_head(torch.cat(mh_embs, dim=1))
             extra_tokens.append(mh_repr.unsqueeze(1))
@@ -357,6 +391,11 @@ class CrossModalAttnFusion(nn.Module):
         # ── 6. Sparse multi-hot (ICD / DRG / Proc / Rx) ───────────────────────
         self.has_multihot = len(self.multihot_dims) > 0
         if self.has_multihot:
+            if getattr(self, 'use_notes', True) and getattr(self, 'note_dim', None) is not None:
+                self.note_to_mh_queries = nn.ModuleDict()
+                for name, vocab_size in self.multihot_dims.items():
+                    emb_dim = max(8, min(32, vocab_size // 4))
+                    self.note_to_mh_queries[name] = nn.Linear(self.note_dim, emb_dim)
             self.mh_emb_dict = nn.ModuleDict()
             mh_repr_dim = 0
             for name, vocab_size in self.multihot_dims.items():
@@ -366,6 +405,7 @@ class CrossModalAttnFusion(nn.Module):
             self.mh_head = nn.Sequential(
                 nn.Linear(mh_repr_dim, 32), nn.ReLU()
             )
+
             fused_dim += 32
 
         # ── 7. Classification head ────────────────────────────────────────────
@@ -378,10 +418,20 @@ class CrossModalAttnFusion(nn.Module):
         )
 
     # ── helpers ──────────────────────────────────────────────────────────────
-    def _multihot_to_embedding(self, x_group, emb):
-        summed = x_group @ emb.weight
-        denom  = torch.clamp(x_group.sum(dim=1, keepdim=True), min=1.0)
-        return summed / denom
+    def _multihot_to_embedding(self, x_group, emb, query_proj=None, x_note=None):
+        import torch
+        import torch.nn.functional as F
+        if x_note is not None and query_proj is not None:
+            query = query_proj(x_note)
+            scores = query @ emb.weight.T
+            scores = scores.masked_fill(x_group == 0, -1e9)
+            attn = F.softmax(scores, dim=1)
+            has_codes = (x_group.sum(dim=1, keepdim=True) > 0).float()
+            return (attn @ emb.weight) * has_codes
+        else:
+            summed = x_group @ emb.weight
+            denom  = torch.clamp(x_group.sum(dim=1, keepdim=True), min=1.0)
+            return summed / denom
 
     def _encode_static(self, x_static):
         static_embs, col_idx = [], 0
@@ -394,11 +444,13 @@ class CrossModalAttnFusion(nn.Module):
             col_idx += 1
         return self.static_head(torch.cat(static_embs, dim=1))
 
-    def _encode_multihot(self, x_mh):
+    def _encode_multihot(self, x_mh, x_note=None):
         mh_embs, col_offset = [], 0
+        import torch
         for name, vocab_size in self.multihot_dims.items():
             group = x_mh[:, col_offset : col_offset + vocab_size]
-            mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name]))
+            query_proj = getattr(self, 'note_to_mh_queries', {}).get(name, None)
+            mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name], query_proj, x_note))
             col_offset += vocab_size
         return self.mh_head(torch.cat(mh_embs, dim=1))
 
@@ -528,6 +580,11 @@ class GatedFusionWithNotes(nn.Module):
         # ── 5. Sparse multi-hot (ICD / DRG / Proc / Rx) ──────────────────────
         self.has_multihot = len(self.multihot_dims) > 0
         if self.has_multihot:
+            if getattr(self, 'use_notes', True) and getattr(self, 'note_dim', None) is not None:
+                self.note_to_mh_queries = nn.ModuleDict()
+                for name, vocab_size in self.multihot_dims.items():
+                    emb_dim = max(8, min(32, vocab_size // 4))
+                    self.note_to_mh_queries[name] = nn.Linear(self.note_dim, emb_dim)
             self.mh_emb_dict = nn.ModuleDict()
             mh_repr_dim = 0
             for name, vocab_size in self.multihot_dims.items():
@@ -537,6 +594,7 @@ class GatedFusionWithNotes(nn.Module):
             self.mh_head = nn.Sequential(
                 nn.Linear(mh_repr_dim, 32), nn.ReLU()
             )
+
             fused_dim += 32
 
         # ── 6. Classification head ───────────────────────────────────────────
@@ -549,10 +607,20 @@ class GatedFusionWithNotes(nn.Module):
             nn.Linear(64, 1)
         )
 
-    def _multihot_to_embedding(self, x_group, emb):
-        summed = x_group @ emb.weight
-        denom  = torch.clamp(x_group.sum(dim=1, keepdim=True), min=1.0)
-        return summed / denom
+    def _multihot_to_embedding(self, x_group, emb, query_proj=None, x_note=None):
+        import torch
+        import torch.nn.functional as F
+        if x_note is not None and query_proj is not None:
+            query = query_proj(x_note)
+            scores = query @ emb.weight.T
+            scores = scores.masked_fill(x_group == 0, -1e9)
+            attn = F.softmax(scores, dim=1)
+            has_codes = (x_group.sum(dim=1, keepdim=True) > 0).float()
+            return (attn @ emb.weight) * has_codes
+        else:
+            summed = x_group @ emb.weight
+            denom  = torch.clamp(x_group.sum(dim=1, keepdim=True), min=1.0)
+            return summed / denom
 
     def forward(self, x_seq, x_static=None, x_mh=None, x_note=None,
                 return_gate=False):
@@ -592,7 +660,8 @@ class GatedFusionWithNotes(nn.Module):
             mh_embs, col_offset = [], 0
             for name, vocab_size in self.multihot_dims.items():
                 group = x_mh[:, col_offset : col_offset + vocab_size]
-                mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name]))
+                query_proj = getattr(self, 'note_to_mh_queries', {}).get(name, None)
+                mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name], query_proj, x_note))
                 col_offset += vocab_size
             reprs.append(self.mh_head(torch.cat(mh_embs, dim=1)))
 
@@ -695,6 +764,11 @@ class PretrainedTransformerCrossModalFusion(nn.Module):
 
         self.has_multihot = len(self.multihot_dims) > 0
         if self.has_multihot:
+            if getattr(self, 'use_notes', True) and getattr(self, 'note_dim', None) is not None:
+                self.note_to_mh_queries = nn.ModuleDict()
+                for name, vocab_size in self.multihot_dims.items():
+                    emb_dim = max(8, min(32, vocab_size // 4))
+                    self.note_to_mh_queries[name] = nn.Linear(self.note_dim, emb_dim)
             self.mh_emb_dict = nn.ModuleDict()
             mh_repr_dim = 0
             for name, vocab_size in self.multihot_dims.items():
@@ -704,6 +778,7 @@ class PretrainedTransformerCrossModalFusion(nn.Module):
             self.mh_head = nn.Sequential(
                 nn.Linear(mh_repr_dim, 32), nn.ReLU()
             )
+
             fused_dim += 32
 
         self.classifier = nn.Sequential(
@@ -714,10 +789,20 @@ class PretrainedTransformerCrossModalFusion(nn.Module):
             nn.Linear(64, 1)
         )
 
-    def _multihot_to_embedding(self, x_group, emb):
-        summed = x_group @ emb.weight
-        denom  = torch.clamp(x_group.sum(dim=1, keepdim=True), min=1.0)
-        return summed / denom
+    def _multihot_to_embedding(self, x_group, emb, query_proj=None, x_note=None):
+        import torch
+        import torch.nn.functional as F
+        if x_note is not None and query_proj is not None:
+            query = query_proj(x_note)
+            scores = query @ emb.weight.T
+            scores = scores.masked_fill(x_group == 0, -1e9)
+            attn = F.softmax(scores, dim=1)
+            has_codes = (x_group.sum(dim=1, keepdim=True) > 0).float()
+            return (attn @ emb.weight) * has_codes
+        else:
+            summed = x_group @ emb.weight
+            denom  = torch.clamp(x_group.sum(dim=1, keepdim=True), min=1.0)
+            return summed / denom
 
     def _encode_static(self, x_static):
         static_embs, col_idx = [], 0
@@ -730,11 +815,13 @@ class PretrainedTransformerCrossModalFusion(nn.Module):
             col_idx += 1
         return self.static_head(torch.cat(static_embs, dim=1))
 
-    def _encode_multihot(self, x_mh):
+    def _encode_multihot(self, x_mh, x_note=None):
         mh_embs, col_offset = [], 0
+        import torch
         for name, vocab_size in self.multihot_dims.items():
             group = x_mh[:, col_offset : col_offset + vocab_size]
-            mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name]))
+            query_proj = getattr(self, 'note_to_mh_queries', {}).get(name, None)
+            mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name], query_proj, x_note))
             col_offset += vocab_size
         return self.mh_head(torch.cat(mh_embs, dim=1))
 
@@ -1423,7 +1510,7 @@ EXP_CONFIG = {
     "lr":          1e-3,
     "batch_size":  256,
     "hidden_dim":  64,
-    "tf_num_layers": 4,          # Increased from 2 to 4 to improve performance
+    "tf_num_layers": 2,          
     "note_dim":    None,         # auto-detected from embeddings (768 for ClinicalBERT, 4096 for Llama)
     "top_k_codes": 64,           # top-K for ICD/DRG/Proc/Rx multi-hot
     "xgb_n_est":   200,
