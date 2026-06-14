@@ -67,11 +67,11 @@ class LSTMLateFusionWithNotes(nn.Module):
         # 3. High-Dim Sparse Features (ICD, DRG, etc.)
         self.has_multihot = len(self.multihot_dims) > 0
         if self.has_multihot:
-            if getattr(self, 'use_notes', True) and getattr(self, 'note_dim', None) is not None:
+            if getattr(self, 'use_notes', True) and note_dim is not None:
                 self.note_to_mh_queries = nn.ModuleDict()
                 for name, vocab_size in self.multihot_dims.items():
                     emb_dim = max(8, min(32, vocab_size // 4))
-                    self.note_to_mh_queries[name] = nn.Linear(self.note_dim, emb_dim)
+                    self.note_to_mh_queries[name] = nn.Linear(note_dim, emb_dim)
             self.mh_emb_dict = nn.ModuleDict()
             mh_repr_dim = 0
             for name, vocab_size in self.multihot_dims.items():
@@ -145,7 +145,7 @@ class LSTMLateFusionWithNotes(nn.Module):
             col_offset = 0
             for name, vocab_size in self.multihot_dims.items():
                 group = x_mh[:, col_offset : col_offset + vocab_size]
-                query_proj = getattr(self, 'note_to_mh_queries', {}).get(name, None)
+                query_proj = self.note_to_mh_queries[name] if hasattr(self, 'note_to_mh_queries') and name in self.note_to_mh_queries else None
                 mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name], query_proj, x_note))
                 col_offset += vocab_size
             reprs.append(self.mh_head(torch.cat(mh_embs, dim=1)))
@@ -176,7 +176,7 @@ class PositionalEncoding(nn.Module):
         return x.transpose(0, 1)
 
 class TransformerEarlyFusionWithNotes(nn.Module):
-    def __init__(self, seq_dim, static_dims=None, multihot_dims=None, hidden_dim=64, note_dim=4096, use_notes=True, nhead=4, num_layers=2):
+    def __init__(self, seq_dim, static_dims=None, multihot_dims=None, hidden_dim=64, note_dim=4096, use_notes=True, nhead=8, num_layers=2):
         super().__init__()
         self.use_notes = use_notes
         self.static_dims = static_dims or {}
@@ -210,11 +210,11 @@ class TransformerEarlyFusionWithNotes(nn.Module):
         # 3. High-Dim Sparse Features (ICD, DRG, etc.)
         self.has_multihot = len(self.multihot_dims) > 0
         if self.has_multihot:
-            if getattr(self, 'use_notes', True) and getattr(self, 'note_dim', None) is not None:
+            if getattr(self, 'use_notes', True) and note_dim is not None:
                 self.note_to_mh_queries = nn.ModuleDict()
                 for name, vocab_size in self.multihot_dims.items():
                     emb_dim = max(8, min(32, vocab_size // 4))
-                    self.note_to_mh_queries[name] = nn.Linear(self.note_dim, emb_dim)
+                    self.note_to_mh_queries[name] = nn.Linear(note_dim, emb_dim)
             self.mh_emb_dict = nn.ModuleDict()
             mh_repr_dim = 0
             for name, vocab_size in self.multihot_dims.items():
@@ -282,7 +282,7 @@ class TransformerEarlyFusionWithNotes(nn.Module):
             col_offset = 0
             for name, vocab_size in self.multihot_dims.items():
                 group = x_mh[:, col_offset : col_offset + vocab_size]
-                query_proj = getattr(self, 'note_to_mh_queries', {}).get(name, None)
+                query_proj = self.note_to_mh_queries[name] if hasattr(self, 'note_to_mh_queries') and name in self.note_to_mh_queries else None
                 mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name], query_proj, x_note))
                 col_offset += vocab_size
             mh_repr = self.mh_head(torch.cat(mh_embs, dim=1))
@@ -327,7 +327,7 @@ class CrossModalAttnFusion(nn.Module):
     steps are most influenced by which note concepts.
     """
     def __init__(self, seq_dim, static_dims=None, multihot_dims=None,
-                 hidden_dim=64, note_dim=4096, nhead=4,
+                 hidden_dim=64, note_dim=4096, nhead=8,
                  num_virtual_tokens=4, num_lstm_layers=2):
         super().__init__()
         self.static_dims   = static_dims   or {}
@@ -391,11 +391,11 @@ class CrossModalAttnFusion(nn.Module):
         # ── 6. Sparse multi-hot (ICD / DRG / Proc / Rx) ───────────────────────
         self.has_multihot = len(self.multihot_dims) > 0
         if self.has_multihot:
-            if getattr(self, 'use_notes', True) and getattr(self, 'note_dim', None) is not None:
+            if getattr(self, 'use_notes', True) and note_dim is not None:
                 self.note_to_mh_queries = nn.ModuleDict()
                 for name, vocab_size in self.multihot_dims.items():
                     emb_dim = max(8, min(32, vocab_size // 4))
-                    self.note_to_mh_queries[name] = nn.Linear(self.note_dim, emb_dim)
+                    self.note_to_mh_queries[name] = nn.Linear(note_dim, emb_dim)
             self.mh_emb_dict = nn.ModuleDict()
             mh_repr_dim = 0
             for name, vocab_size in self.multihot_dims.items():
@@ -449,7 +449,7 @@ class CrossModalAttnFusion(nn.Module):
         import torch
         for name, vocab_size in self.multihot_dims.items():
             group = x_mh[:, col_offset : col_offset + vocab_size]
-            query_proj = getattr(self, 'note_to_mh_queries', {}).get(name, None)
+            query_proj = self.note_to_mh_queries[name] if hasattr(self, 'note_to_mh_queries') and name in self.note_to_mh_queries else None
             mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name], query_proj, x_note))
             col_offset += vocab_size
         return self.mh_head(torch.cat(mh_embs, dim=1))
@@ -580,11 +580,11 @@ class GatedFusionWithNotes(nn.Module):
         # ── 5. Sparse multi-hot (ICD / DRG / Proc / Rx) ──────────────────────
         self.has_multihot = len(self.multihot_dims) > 0
         if self.has_multihot:
-            if getattr(self, 'use_notes', True) and getattr(self, 'note_dim', None) is not None:
+            if getattr(self, 'use_notes', True) and note_dim is not None:
                 self.note_to_mh_queries = nn.ModuleDict()
                 for name, vocab_size in self.multihot_dims.items():
                     emb_dim = max(8, min(32, vocab_size // 4))
-                    self.note_to_mh_queries[name] = nn.Linear(self.note_dim, emb_dim)
+                    self.note_to_mh_queries[name] = nn.Linear(note_dim, emb_dim)
             self.mh_emb_dict = nn.ModuleDict()
             mh_repr_dim = 0
             for name, vocab_size in self.multihot_dims.items():
@@ -660,7 +660,7 @@ class GatedFusionWithNotes(nn.Module):
             mh_embs, col_offset = [], 0
             for name, vocab_size in self.multihot_dims.items():
                 group = x_mh[:, col_offset : col_offset + vocab_size]
-                query_proj = getattr(self, 'note_to_mh_queries', {}).get(name, None)
+                query_proj = self.note_to_mh_queries[name] if hasattr(self, 'note_to_mh_queries') and name in self.note_to_mh_queries else None
                 mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name], query_proj, x_note))
                 col_offset += vocab_size
             reprs.append(self.mh_head(torch.cat(mh_embs, dim=1)))
@@ -672,8 +672,168 @@ class GatedFusionWithNotes(nn.Module):
             return logits, g.mean(dim=0)  # avg gate per hidden dim for analysis
         return logits
 
+class FullyCrossModalFusion(nn.Module):
+    """
+    Plan A: Note-Guided Temporal Cross-Attention.
+    Instead of using the sequence as Query and note as Key/Value,
+    this uses the Note (virtual tokens) as Query, and the LSTM sequence output as Key/Value.
+    This creates a Text-Guided Temporal summary.
+    """
+    def __init__(self, seq_dim, static_dims=None, multihot_dims=None,
+                 hidden_dim=64, note_dim=4096, nhead=8,
+                 num_virtual_tokens=4, num_lstm_layers=2):
+        super().__init__()
+        self.static_dims   = static_dims   or {}
+        self.multihot_dims = multihot_dims or {}
+        self.hidden_dim    = hidden_dim
+        self.M             = num_virtual_tokens
+
+        # ── 1. Physiological sequence encoder ────────────────────────────────
+        self.lstm = nn.LSTM(
+            input_size=seq_dim, hidden_size=hidden_dim,
+            num_layers=num_lstm_layers, batch_first=True,
+            dropout=0.1 if num_lstm_layers > 1 else 0.0
+        )
+
+        # ── 2. Note → M virtual tokens ────────────────────────────────────────
+        self.note_proj = nn.Sequential(
+            nn.LayerNorm(note_dim),
+            nn.Linear(note_dim, hidden_dim * 4), nn.GELU(), nn.Dropout(0.2),
+            nn.Linear(hidden_dim * 4, hidden_dim * num_virtual_tokens),
+        )
+
+        # ── 3. Cross-Attention block (note queries ← seq keys/values) ─────────
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim, num_heads=nhead,
+            dropout=0.1, batch_first=True
+        )
+        self.cross_norm  = nn.LayerNorm(hidden_dim)   
+        self.cross_ff    = nn.Sequential(             
+            nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+        self.cross_ff_norm = nn.LayerNorm(hidden_dim)
+
+        fused_dim = hidden_dim
+
+        # ── 4. Static (demographics) ──────────────────────────────────────────
+        self.has_static = len(self.static_dims) > 0
+        if self.has_static:
+            self.emb_dict      = nn.ModuleDict()
+            static_repr_dim    = 0
+            for name, vocab_size in self.static_dims.items():
+                if name in ['age', 'los_residual']: continue
+                emb_dim = max(4, min(16, vocab_size // 2))
+                self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
+                static_repr_dim += emb_dim
+            if 'age' in self.static_dims:
+                static_repr_dim += 1
+            if 'los_residual' in self.static_dims:
+                static_repr_dim += 1
+            self.static_head = nn.Sequential(
+                nn.Linear(static_repr_dim, 32), nn.ReLU()
+            )
+            fused_dim += 32
+
+        # ── 5. Sparse multi-hot (ICD / DRG / Proc / Rx) ───────────────────────
+        self.has_multihot = len(self.multihot_dims) > 0
+        if self.has_multihot:
+            if getattr(self, 'use_notes', True) and note_dim is not None:
+                self.note_to_mh_queries = nn.ModuleDict()
+                for name, vocab_size in self.multihot_dims.items():
+                    emb_dim = max(8, min(32, vocab_size // 4))
+                    self.note_to_mh_queries[name] = nn.Linear(note_dim, emb_dim)
+            self.mh_emb_dict = nn.ModuleDict()
+            mh_repr_dim = 0
+            for name, vocab_size in self.multihot_dims.items():
+                emb_dim = max(8, min(32, vocab_size // 4))
+                self.mh_emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
+                mh_repr_dim += emb_dim
+            self.mh_head = nn.Sequential(
+                nn.Linear(mh_repr_dim, 32), nn.ReLU()
+            )
+            fused_dim += 32
+
+        # ── 6. Classification head ────────────────────────────────────────────
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(fused_dim),
+            nn.Dropout(0.3),
+            nn.Linear(fused_dim, 64), nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 1)
+        )
+
+    def _multihot_to_embedding(self, x_group, emb, query_proj=None, x_note=None):
+        import torch.nn.functional as F
+        if x_note is not None and query_proj is not None:
+            query = query_proj(x_note)
+            scores = query @ emb.weight.T
+            scores = scores.masked_fill(x_group == 0, -1e9)
+            attn = F.softmax(scores, dim=1)
+            has_codes = (x_group.sum(dim=1, keepdim=True) > 0).float()
+            return (attn @ emb.weight) * has_codes
+        else:
+            w = (x_group > 0).float()
+            row_sums = w.sum(dim=1, keepdim=True)
+            row_sums = row_sums.masked_fill(row_sums == 0, 1.0)
+            return (w @ emb.weight) / row_sums
+
+    def forward(self, x_seq, x_static=None, x_mh=None, x_note=None):
+        reprs = []
+        B = x_seq.size(0)
+
+        # 1. Sequence Modality (LSTM)
+        H_seq_all, _ = self.lstm(x_seq) # [B, T, d]
+        
+        # 2. Text Modality & Cross-Attention for Time-Series
+        if getattr(self, 'use_notes', True) and x_note is not None:
+            H_note = self.note_proj(x_note).view(B, self.M, self.hidden_dim) # [B, M, d]
+            
+            # Cross-Attention: Note (Query) -> Sequence (Key/Value)
+            H_cross, attn_w = self.cross_attn(query=H_note, key=H_seq_all, value=H_seq_all)
+            
+            # Save attention map [B, M, T] -> pool over M to get [B, T]
+            self.last_temporal_attn = attn_w.mean(dim=1).detach()
+            
+            # Add & Norm
+            H_note_fused = self.cross_norm(H_note + H_cross)
+            H_note_fused = self.cross_ff_norm(H_note_fused + self.cross_ff(H_note_fused))
+            
+            # Temporal Summary = mean over the M virtual tokens
+            H_seq = H_note_fused.mean(dim=1) # [B, d]
+        else:
+            H_seq = H_seq_all[:, -1, :] # Fallback
+
+        reprs.append(H_seq)
+
+        # 3. Static codes
+        if self.has_static and x_static is not None:
+            static_embs, col_idx = [], 0
+            for name, vocab_size in self.static_dims.items():
+                val = x_static[:, col_idx]
+                if name in ['age', 'los_residual']:
+                    static_embs.append(val.unsqueeze(1).float())
+                else:
+                    static_embs.append(self.emb_dict[name](val.long()))
+                col_idx += 1
+            reprs.append(self.static_head(torch.cat(static_embs, dim=1)))
+
+        # 4. Sparse codes
+        if self.has_multihot and x_mh is not None:
+            mh_embs, col_offset = [], 0
+            for name, vocab_size in self.multihot_dims.items():
+                group = x_mh[:, col_offset : col_offset + vocab_size]
+                query_proj = self.note_to_mh_queries[name] if hasattr(self, 'note_to_mh_queries') and name in self.note_to_mh_queries else None
+                mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name], query_proj, x_note))
+                col_offset += vocab_size
+            reprs.append(self.mh_head(torch.cat(mh_embs, dim=1)))
+
+        fused = torch.cat(reprs, dim=1) if len(reprs) > 1 else reprs[0]
+        return self.classifier(fused).squeeze(-1)
+
 class TransformerSeqEncoder(nn.Module):
-    def __init__(self, seq_input_dim, hidden_dim, num_layers=2, dropout=0.1, nhead=4):
+    def __init__(self, seq_input_dim, hidden_dim, num_layers=2, dropout=0.1, nhead=8):
         super().__init__()
         self.seq_proj = nn.Linear(seq_input_dim, hidden_dim)
         self.pos_encoder = PositionalEncoding(hidden_dim, dropout)
@@ -714,7 +874,7 @@ class TransformerPretrainer(nn.Module):
 
 class PretrainedTransformerCrossModalFusion(nn.Module):
     def __init__(self, encoder, static_dims=None, multihot_dims=None,
-                 hidden_dim=64, note_dim=4096, nhead=4, num_virtual_tokens=4):
+                 hidden_dim=64, note_dim=4096, nhead=8, num_virtual_tokens=4):
         super().__init__()
         self.encoder = encoder
         self.static_dims = static_dims or {}
@@ -764,11 +924,11 @@ class PretrainedTransformerCrossModalFusion(nn.Module):
 
         self.has_multihot = len(self.multihot_dims) > 0
         if self.has_multihot:
-            if getattr(self, 'use_notes', True) and getattr(self, 'note_dim', None) is not None:
+            if getattr(self, 'use_notes', True) and note_dim is not None:
                 self.note_to_mh_queries = nn.ModuleDict()
                 for name, vocab_size in self.multihot_dims.items():
                     emb_dim = max(8, min(32, vocab_size // 4))
-                    self.note_to_mh_queries[name] = nn.Linear(self.note_dim, emb_dim)
+                    self.note_to_mh_queries[name] = nn.Linear(note_dim, emb_dim)
             self.mh_emb_dict = nn.ModuleDict()
             mh_repr_dim = 0
             for name, vocab_size in self.multihot_dims.items():
@@ -820,7 +980,7 @@ class PretrainedTransformerCrossModalFusion(nn.Module):
         import torch
         for name, vocab_size in self.multihot_dims.items():
             group = x_mh[:, col_offset : col_offset + vocab_size]
-            query_proj = getattr(self, 'note_to_mh_queries', {}).get(name, None)
+            query_proj = self.note_to_mh_queries[name] if hasattr(self, 'note_to_mh_queries') and name in self.note_to_mh_queries else None
             mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name], query_proj, x_note))
             col_offset += vocab_size
         return self.mh_head(torch.cat(mh_embs, dim=1))
@@ -1699,7 +1859,7 @@ def main():
     model_cross = CrossModalAttnFusion(
         seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims,
         hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'],
-        nhead=4, num_virtual_tokens=4
+        nhead=8, num_virtual_tokens=4
     )
     model_cross, hist_cross = train_model(
         model_cross, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
@@ -1711,6 +1871,23 @@ def main():
     _log_eval_result('CrossModal Attention', eval_cross)
     torch.save(model_cross.state_dict(), os.path.join(exp_dir, 'model_cross_attn.pt'))
     logging.info(f"Cross-Modal Attention model saved to {exp_dir}/model_cross_attn.pt")
+    
+    logging.info("4.5. Training Fully Cross-Modal Fusion (Note-Guided Temporal Attention)...")
+    model_fully_cross = FullyCrossModalFusion(
+        seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims,
+        hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'],
+        nhead=8, num_virtual_tokens=4
+    )
+    model_fully_cross, hist_fully_cross = train_model(
+        model_fully_cross, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
+        X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
+        epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG['batch_size'],
+        pos_weight=pos_weight_val)
+    all_epoch_histories['fully_crossmodal_attention'] = hist_fully_cross
+    eval_fully_cross = evaluate_model(model_fully_cross, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
+    _log_eval_result('Fully CrossModal', eval_fully_cross)
+    torch.save(model_fully_cross.state_dict(), os.path.join(exp_dir, 'model_fully_cross_attn.pt'))
+    logging.info(f"Fully Cross-Modal Attention model saved to {exp_dir}/model_fully_cross_attn.pt")
     
     logging.info("5. Training Gated Fusion (LSTM × Note Gated Blend)...")
     model_gated = GatedFusionWithNotes(
@@ -1741,7 +1918,7 @@ def main():
         encoder=pretrained_encoder,
         static_dims=ordered_static_dims, multihot_dims=multihot_dims,
         hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'],
-        nhead=4, num_virtual_tokens=4
+        nhead=8, num_virtual_tokens=4
     )
     
     # 3. Fine-tune
@@ -1785,6 +1962,7 @@ def main():
         'lstm_latefusion_notes': eval_notes,
         'transformer_earlyfusion_notes': eval_tf,
         'crossmodal_attention': eval_cross,
+        'fully_crossmodal_attention': eval_fully_cross,
         'gated_fusion': eval_gated,
         'pretrained_crossmodal': eval_pretrain_cross,
         'xgb_base': eval_xgb_base,
@@ -1817,6 +1995,7 @@ def main():
         ('XGBoost Base', eval_xgb_base), ('XGBoost + Notes', eval_xgb_notes),
         ('LSTM Base', eval_base), ('LSTM LateFusion', eval_notes),
         ('Transformer EarlyFusion', eval_tf), ('CrossModal Attention', eval_cross),
+        ('Fully CrossModal', eval_fully_cross),
         ('Gated Fusion', eval_gated), ('Transformer Pretrain+CrossModal', eval_pretrain_cross),
     ]:
         m = _m(result)
@@ -1900,7 +2079,8 @@ def main():
 {_note_row('LSTM Base', eval_base)}
 {_note_row('LSTM LateFusion (+ Notes)', eval_notes)}
 {_note_row('Transformer EarlyFusion (+ Notes)', eval_tf)}
-{_note_row('CrossModal Attn', eval_cross)}
+{_note_row('CrossModal Attention', eval_cross)}
+{_note_row('Fully CrossModal', eval_fully_cross)}
 {_note_row('Gated Fusion', eval_gated)}
 {_note_row('**Pretrain+CrossModal**', eval_pretrain_cross)}
 
@@ -1912,7 +2092,8 @@ def main():
 {_note_row_05('LSTM Base', eval_base)}
 {_note_row_05('LSTM LateFusion (+ Notes)', eval_notes)}
 {_note_row_05('Transformer EarlyFusion (+ Notes)', eval_tf)}
-{_note_row_05('CrossModal Attn', eval_cross)}
+{_note_row_05('CrossModal Attention', eval_cross)}
+{_note_row_05('Fully CrossModal', eval_fully_cross)}
 {_note_row_05('Gated Fusion', eval_gated)}
 {_note_row_05('**Pretrain+CrossModal**', eval_pretrain_cross)}
 
@@ -1928,8 +2109,9 @@ def main():
 | `model_lstm_base.pt`   | Base LSTM state_dict |
 | `model_lstm_notes.pt`  | Late Fusion LSTM state_dict |
 | `model_tf_notes.pt`    | Early Fusion Transformer state_dict |
-| `model_cross_attn.pt`  | CrossModal Attention Fusion state_dict |
-| `model_gated_fusion.pt` | Gated Fusion state_dict |
+| `model_cross_attn.pt`  | Cross-Modal Attention model state_dict |
+| `model_fully_cross_attn.pt` | Fully Cross-Modal Temporal Attention state_dict |
+| `model_gated_fusion.pt` | Gated Fusion model state_dict |
 | `model_pretrained_cross_attn.pt` | Pretrained CrossModal Fusion state_dict |
 | `model_xgb_base.json`  | XGBoost Base (XGBoost native format) |
 | `model_xgb_notes.json` | XGBoost + Notes (XGBoost native format) |
