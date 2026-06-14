@@ -453,6 +453,148 @@ class CrossModalAttnFusion(nn.Module):
             return logits, attn_weights   # attn_weights: [B, T, M]
         return logits
 
+
+class GatedFusionWithNotes(nn.Module):
+    """
+    Gated Fusion for readmission prediction.
+
+    Instead of naively concatenating LSTM and note representations, a
+    learnable gate decides how much to trust each modality:
+
+        g = σ(W_h · h_lstm + W_e · f(e_llm) + b)
+        x_fused = g ⊙ h_lstm + (1-g) ⊙ f(e_llm)
+
+    When physiological signals already strongly indicate the outcome,
+    the gate drives g→1 and suppresses note influence, preventing
+    noisy or redundant text features from hurting performance.
+    """
+    def __init__(self, seq_dim, static_dims=None, multihot_dims=None,
+                 hidden_dim=64, note_dim=4096, num_lstm_layers=2):
+        super().__init__()
+        self.static_dims   = static_dims   or {}
+        self.multihot_dims = multihot_dims or {}
+        self.hidden_dim    = hidden_dim
+
+        # ── 1. Physiological sequence encoder ────────────────────────────────
+        self.lstm = nn.LSTM(
+            input_size=seq_dim, hidden_size=hidden_dim,
+            num_layers=num_lstm_layers, batch_first=True,
+            dropout=0.1 if num_lstm_layers > 1 else 0.0
+        )
+        self.attn = nn.Linear(hidden_dim, 1)
+
+        # ── 2. Note projection → same dim as LSTM output ─────────────────────
+        self.note_proj = nn.Sequential(
+            nn.LayerNorm(note_dim),
+            nn.Linear(note_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+
+        # ── 3. Gating mechanism ──────────────────────────────────────────────
+        # g = σ(W_h · h + W_e · e + b)
+        self.gate_h = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.gate_e = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.gate_bias = nn.Parameter(torch.zeros(hidden_dim))
+
+        fused_dim = hidden_dim
+
+        # ── 4. Static (demographics) ─────────────────────────────────────────
+        self.has_static = len(self.static_dims) > 0
+        if self.has_static:
+            self.emb_dict = nn.ModuleDict()
+            static_repr_dim = 0
+            for name, vocab_size in self.static_dims.items():
+                if name == 'age': continue
+                emb_dim = max(4, min(16, vocab_size // 2))
+                self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
+                static_repr_dim += emb_dim
+            if 'age' in self.static_dims:
+                static_repr_dim += 1
+            self.static_head = nn.Sequential(
+                nn.Linear(static_repr_dim, 32), nn.ReLU()
+            )
+            fused_dim += 32
+
+        # ── 5. Sparse multi-hot (ICD / DRG / Proc / Rx) ──────────────────────
+        self.has_multihot = len(self.multihot_dims) > 0
+        if self.has_multihot:
+            self.mh_emb_dict = nn.ModuleDict()
+            mh_repr_dim = 0
+            for name, vocab_size in self.multihot_dims.items():
+                emb_dim = max(8, min(32, vocab_size // 4))
+                self.mh_emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
+                mh_repr_dim += emb_dim
+            self.mh_head = nn.Sequential(
+                nn.Linear(mh_repr_dim, 32), nn.ReLU()
+            )
+            fused_dim += 32
+
+        # ── 6. Classification head ───────────────────────────────────────────
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(fused_dim),
+            nn.Dropout(0.3),
+            nn.Linear(fused_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 1)
+        )
+
+    def _multihot_to_embedding(self, x_group, emb):
+        summed = x_group @ emb.weight
+        denom  = torch.clamp(x_group.sum(dim=1, keepdim=True), min=1.0)
+        return summed / denom
+
+    def forward(self, x_seq, x_static=None, x_mh=None, x_note=None,
+                return_gate=False):
+        import torch.nn.functional as F
+
+        # 1. LSTM → temporal attention pooling → h [B, hidden_dim]
+        lstm_out, _ = self.lstm(x_seq)
+        attn_w = torch.softmax(self.attn(lstm_out).squeeze(-1), dim=1)
+        h = (lstm_out * attn_w.unsqueeze(-1)).sum(dim=1)  # [B, d]
+
+        # 2. Note projection → e [B, hidden_dim]
+        if x_note is not None:
+            e = self.note_proj(F.normalize(x_note, p=2, dim=1))  # [B, d]
+        else:
+            e = torch.zeros_like(h)
+
+        # 3. Gated fusion: g = σ(W_h·h + W_e·e + b)
+        g = torch.sigmoid(self.gate_h(h) + self.gate_e(e) + self.gate_bias)  # [B, d]
+        fused_repr = g * h + (1.0 - g) * e  # [B, d]
+
+        reprs = [fused_repr]
+
+        # 4. Demographics
+        if self.has_static and x_static is not None:
+            static_embs, col_idx = [], 0
+            for name, _ in self.static_dims.items():
+                val = x_static[:, col_idx]
+                if name == 'age':
+                    static_embs.append(val.unsqueeze(1).float())
+                else:
+                    static_embs.append(self.emb_dict[name](val.long()))
+                col_idx += 1
+            reprs.append(self.static_head(torch.cat(static_embs, dim=1)))
+
+        # 5. Sparse codes
+        if self.has_multihot and x_mh is not None:
+            mh_embs, col_offset = [], 0
+            for name, vocab_size in self.multihot_dims.items():
+                group = x_mh[:, col_offset : col_offset + vocab_size]
+                mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name]))
+                col_offset += vocab_size
+            reprs.append(self.mh_head(torch.cat(mh_embs, dim=1)))
+
+        fused = torch.cat(reprs, dim=1) if len(reprs) > 1 else reprs[0]
+        logits = self.classifier(fused).squeeze(-1)
+
+        if return_gate:
+            return logits, g.mean(dim=0)  # avg gate per hidden dim for analysis
+        return logits
+
 def _compute_prauc(y_true, y_score):
     """Compute area under precision-recall curve via trapezoidal rule."""
     y_true = np.asarray(y_true, dtype=np.int64)
@@ -1092,6 +1234,22 @@ def main():
     torch.save(model_cross.state_dict(), os.path.join(exp_dir, 'model_cross_attn.pt'))
     logging.info(f"Cross-Modal Attention model saved to {exp_dir}/model_cross_attn.pt")
     
+    logging.info("5. Training Gated Fusion (LSTM × Note Gated Blend)...")
+    model_gated = GatedFusionWithNotes(
+        seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims,
+        hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'],
+    )
+    model_gated, hist_gated = train_model(
+        model_gated, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
+        X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
+        epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG['batch_size'],
+        pos_weight=pos_weight_val)
+    all_epoch_histories['gated_fusion'] = hist_gated
+    eval_gated = evaluate_model(model_gated, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
+    _log_eval_result('Gated Fusion', eval_gated)
+    torch.save(model_gated.state_dict(), os.path.join(exp_dir, 'model_gated_fusion.pt'))
+    logging.info(f"Gated Fusion model saved to {exp_dir}/model_gated_fusion.pt")
+    
     # XGBoost natively handles class imbalance via scale_pos_weight (equivalent to pos_weight)
     X_xgb_base = flatten_features(X_seq, X_static, X_mh)
     xgb_base = xgb.XGBClassifier(n_estimators=200, max_depth=6,
@@ -1121,6 +1279,7 @@ def main():
         'lstm_latefusion_notes': eval_notes,
         'transformer_earlyfusion_notes': eval_tf,
         'crossmodal_attention': eval_cross,
+        'gated_fusion': eval_gated,
         'xgb_base': eval_xgb_base,
         'xgb_notes': eval_xgb_notes,
     }
@@ -1151,6 +1310,7 @@ def main():
         ('XGBoost Base', eval_xgb_base), ('XGBoost + Notes', eval_xgb_notes),
         ('LSTM Base', eval_base), ('LSTM LateFusion', eval_notes),
         ('Transformer EarlyFusion', eval_tf), ('CrossModal Attention', eval_cross),
+        ('Gated Fusion', eval_gated),
     ]:
         m = _m(result)
         logging.info(
@@ -1233,7 +1393,8 @@ def main():
 {_note_row('LSTM Base', eval_base)}
 {_note_row('LSTM LateFusion (+ Notes)', eval_notes)}
 {_note_row('Transformer EarlyFusion (+ Notes)', eval_tf)}
-{_note_row('**CrossModal Attn**', eval_cross)}
+{_note_row('CrossModal Attn', eval_cross)}
+{_note_row('**Gated Fusion**', eval_gated)}
 
 ## Ablation Study Results — Test Set @ Fixed Threshold 0.5
 | Model | Threshold | AUROC | PRAUC | Precision | Recall | F1 | Brier |
@@ -1243,12 +1404,14 @@ def main():
 {_note_row_05('LSTM Base', eval_base)}
 {_note_row_05('LSTM LateFusion (+ Notes)', eval_notes)}
 {_note_row_05('Transformer EarlyFusion (+ Notes)', eval_tf)}
-{_note_row_05('**CrossModal Attn**', eval_cross)}
+{_note_row_05('CrossModal Attn', eval_cross)}
+{_note_row_05('**Gated Fusion**', eval_gated)}
 
 ### Note Embedding Impact (AUROC)
 - XGBoost: notes Δ AUC = {_m(eval_xgb_notes)['roc_auc'] - _m(eval_xgb_base)['roc_auc']:+.4f}
 - LSTM Late Fusion:       notes Δ AUC = {_m(eval_notes)['roc_auc'] - _m(eval_base)['roc_auc']:+.4f}
 - CrossModal Attn Fusion: vs LSTM Base Δ AUC = {_m(eval_cross)['roc_auc'] - _m(eval_base)['roc_auc']:+.4f}
+- **Gated Fusion: vs LSTM Base Δ AUC = {_m(eval_gated)['roc_auc'] - _m(eval_base)['roc_auc']:+.4f}**
 
 ## Saved Files
 | File | Description |
@@ -1257,6 +1420,7 @@ def main():
 | `model_lstm_notes.pt`  | Late Fusion LSTM state_dict |
 | `model_tf_notes.pt`    | Early Fusion Transformer state_dict |
 | `model_cross_attn.pt`  | CrossModal Attention Fusion state_dict |
+| `model_gated_fusion.pt` | Gated Fusion state_dict |
 | `model_xgb_base.json`  | XGBoost Base (XGBoost native format) |
 | `model_xgb_notes.json` | XGBoost + Notes (XGBoost native format) |
 | `seq_scaler.pkl`       | StandardScaler for sequence features (required for inference) |
