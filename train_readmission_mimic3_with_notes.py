@@ -47,13 +47,15 @@ class LSTMLateFusionWithNotes(nn.Module):
             self.emb_dict = nn.ModuleDict()
             static_repr_dim = 0
             for name, vocab_size in self.static_dims.items():
-                if name == 'age':  
+                if name in ['age', 'los_residual']:  
                     continue
                 emb_dim = max(4, min(16, vocab_size // 2))
                 self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
                 static_repr_dim += emb_dim
                 
             if 'age' in self.static_dims:
+                static_repr_dim += 1
+            if 'los_residual' in self.static_dims:
                 static_repr_dim += 1
                 
             self.static_head = nn.Sequential(
@@ -115,7 +117,7 @@ class LSTMLateFusionWithNotes(nn.Module):
             col_idx = 0
             for name, _ in self.static_dims.items():
                 val = x_static[:, col_idx]
-                if name == 'age':
+                if name in ['age', 'los_residual']:
                     static_embs.append(val.unsqueeze(1).float())
                 else:
                     static_embs.append(self.emb_dict[name](val.long()))
@@ -178,11 +180,13 @@ class TransformerEarlyFusionWithNotes(nn.Module):
             self.emb_dict = nn.ModuleDict()
             static_repr_dim = 0
             for name, vocab_size in self.static_dims.items():
-                if name == 'age': continue
+                if name in ['age', 'los_residual']: continue
                 emb_dim = max(4, min(16, vocab_size // 2))
                 self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
                 static_repr_dim += emb_dim
             if 'age' in self.static_dims:
+                static_repr_dim += 1
+            if 'los_residual' in self.static_dims:
                 static_repr_dim += 1
             self.static_head = nn.Sequential(nn.Linear(static_repr_dim, hidden_dim), nn.ReLU())
             
@@ -232,7 +236,7 @@ class TransformerEarlyFusionWithNotes(nn.Module):
             col_idx = 0
             for name, _ in self.static_dims.items():
                 val = x_static[:, col_idx]
-                if name == 'age':
+                if name in ['age', 'los_residual']:
                     static_embs.append(val.unsqueeze(1).float())
                 else:
                     static_embs.append(self.emb_dict[name](val.long()))
@@ -337,11 +341,13 @@ class CrossModalAttnFusion(nn.Module):
             self.emb_dict      = nn.ModuleDict()
             static_repr_dim    = 0
             for name, vocab_size in self.static_dims.items():
-                if name == 'age': continue
+                if name in ['age', 'los_residual']: continue
                 emb_dim = max(4, min(16, vocab_size // 2))
                 self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
                 static_repr_dim += emb_dim
             if 'age' in self.static_dims:
+                static_repr_dim += 1
+            if 'los_residual' in self.static_dims:
                 static_repr_dim += 1
             self.static_head = nn.Sequential(
                 nn.Linear(static_repr_dim, 32), nn.ReLU()
@@ -381,7 +387,7 @@ class CrossModalAttnFusion(nn.Module):
         static_embs, col_idx = [], 0
         for name, _ in self.static_dims.items():
             val = x_static[:, col_idx]
-            if name == 'age':
+            if name in ['age', 'los_residual']:
                 static_embs.append(val.unsqueeze(1).float())
             else:
                 static_embs.append(self.emb_dict[name](val.long()))
@@ -506,11 +512,13 @@ class GatedFusionWithNotes(nn.Module):
             self.emb_dict = nn.ModuleDict()
             static_repr_dim = 0
             for name, vocab_size in self.static_dims.items():
-                if name == 'age': continue
+                if name in ['age', 'los_residual']: continue
                 emb_dim = max(4, min(16, vocab_size // 2))
                 self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
                 static_repr_dim += emb_dim
             if 'age' in self.static_dims:
+                static_repr_dim += 1
+            if 'los_residual' in self.static_dims:
                 static_repr_dim += 1
             self.static_head = nn.Sequential(
                 nn.Linear(static_repr_dim, 32), nn.ReLU()
@@ -572,7 +580,7 @@ class GatedFusionWithNotes(nn.Module):
             static_embs, col_idx = [], 0
             for name, _ in self.static_dims.items():
                 val = x_static[:, col_idx]
-                if name == 'age':
+                if name in ['age', 'los_residual']:
                     static_embs.append(val.unsqueeze(1).float())
                 else:
                     static_embs.append(self.emb_dict[name](val.long()))
@@ -672,11 +680,13 @@ class PretrainedTransformerCrossModalFusion(nn.Module):
             self.emb_dict = nn.ModuleDict()
             static_repr_dim = 0
             for name, vocab_size in self.static_dims.items():
-                if name == 'age': continue
+                if name in ['age', 'los_residual']: continue
                 emb_dim = max(4, min(16, vocab_size // 2))
                 self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
                 static_repr_dim += emb_dim
             if 'age' in self.static_dims:
+                static_repr_dim += 1
+            if 'los_residual' in self.static_dims:
                 static_repr_dim += 1
             self.static_head = nn.Sequential(
                 nn.Linear(static_repr_dim, 32), nn.ReLU()
@@ -713,7 +723,7 @@ class PretrainedTransformerCrossModalFusion(nn.Module):
         static_embs, col_idx = [], 0
         for name, _ in self.static_dims.items():
             val = x_static[:, col_idx]
-            if name == 'age':
+            if name in ['age', 'los_residual']:
                 static_embs.append(val.unsqueeze(1).float())
             else:
                 static_embs.append(self.emb_dict[name](val.long()))
@@ -1159,6 +1169,96 @@ def build_multihot_features(con, table, id_col, val_col, valid_ids, top_k, trim=
         
     return feature_dict, len(vocab)
 
+def compute_los_residuals(stays_df, con):
+    logging.info("Computing OLS-based Expected LOS Residuals on global dataset...")
+    
+    # Register temporary table for DuckDB
+    con.register('stays_df_tmp', stays_df[['HADM_ID', 'stay_id', 'INTIME']])
+    
+    transfers_df = con.query("""
+        SELECT t.HADM_ID, count(*) as pre_icu_transfers
+        FROM read_csv_auto('/home/hanwen/data/mimic/iii/TRANSFERS.csv', sample_size=-1) t
+        JOIN stays_df_tmp s ON t.HADM_ID = s.HADM_ID
+        WHERE CAST(t.OUTTIME AS TIMESTAMP) <= CAST(s.INTIME AS TIMESTAMP)
+        GROUP BY t.HADM_ID
+    """).df()
+    
+    surg_df = con.query("""
+        SELECT 
+            s.HADM_ID, 
+            count(p.ITEMID) as surg_count,
+            max(CAST(p.ENDTIME AS TIMESTAMP)) as last_surg_endtime
+        FROM stays_df_tmp s
+        JOIN read_csv_auto('/home/hanwen/data/mimic/iii/PROCEDUREEVENTS_MV.csv', sample_size=-1) p 
+            ON s.HADM_ID = p.HADM_ID AND CAST(p.ENDTIME AS TIMESTAMP) <= CAST(s.INTIME AS TIMESTAMP)
+        GROUP BY s.HADM_ID
+    """).df()
+    
+    df = stays_df.copy()
+    
+    df = df.merge(transfers_df, on='HADM_ID', how='left')
+    df['pre_icu_transfers'] = df['pre_icu_transfers'].fillna(0)
+    
+    df = df.merge(surg_df, on='HADM_ID', how='left')
+    df['surg_count'] = df['surg_count'].fillna(0)
+    df['surg_flag'] = (df['surg_count'] > 0).astype(int)
+    
+    df['last_surg_endtime'] = pd.to_datetime(df['last_surg_endtime'])
+    df['INTIME'] = pd.to_datetime(df['INTIME'])
+    gap_hours = (df['INTIME'] - df['last_surg_endtime']).dt.total_seconds() / 3600.0
+    df['surg_gap'] = np.where(gap_hours > 0, gap_hours, 0)
+    df['log_surg_gap'] = np.log1p(df['surg_gap'])
+    
+    df['EDREGTIME'] = pd.to_datetime(df['EDREGTIME'])
+    df['EDOUTTIME'] = pd.to_datetime(df['EDOUTTIME'])
+    ed_wait = (df['EDOUTTIME'] - df['EDREGTIME']).dt.total_seconds() / 3600.0
+    df['log_ed_wait'] = np.log1p(np.where((ed_wait > 0) & (ed_wait < 240), ed_wait, 0))
+    
+    # Target
+    df['actual_los'] = df['LOS'].fillna((pd.to_datetime(df['OUTTIME']) - pd.to_datetime(df['INTIME'])).dt.total_seconds() / 86400.0)
+    df['Y'] = np.log1p(df['actual_los'].clip(lower=0))
+    
+    from sklearn.preprocessing import OneHotEncoder
+    from sklearn.linear_model import LinearRegression
+    
+    cat_cols = ['ADMISSION_TYPE', 'ADMISSION_LOCATION', 'INSURANCE', 'FIRST_CAREUNIT', 'GENDER']
+    for col in cat_cols:
+        df[col] = df[col].astype(str)
+        top8 = df[col].value_counts().nlargest(8).index
+        df[col] = np.where(df[col].isin(top8), df[col], 'OTHER')
+    
+    ohe = OneHotEncoder(sparse_output=False, drop='first')
+    cat_features = ohe.fit_transform(df[cat_cols])
+    
+    # Calculate age for OLS
+    df['DOB'] = pd.to_datetime(df['DOB'], errors='coerce')
+    df['age'] = (df['INTIME'] - df['DOB']).dt.days / 365.25
+    df['age'] = df['age'].clip(0, 100)
+    
+    num_features = df[['age', 'pre_icu_transfers', 'surg_count', 'surg_flag', 'log_surg_gap', 'log_ed_wait']].fillna(0).values
+    
+    X = np.hstack([num_features, cat_features])
+    Y = df['Y'].values
+    
+    valid_mask = ~np.isnan(Y)
+    
+    model = LinearRegression()
+    if valid_mask.sum() > 0:
+        model.fit(X[valid_mask], Y[valid_mask])
+        Y_pred = model.predict(X)
+        df['los_residual'] = np.where(valid_mask, Y - Y_pred, 0.0)
+        r2 = model.score(X[valid_mask], Y[valid_mask])
+    else:
+        df['los_residual'] = 0.0
+        r2 = 0.0
+        
+    logging.info(f"  OLS Model trained on {valid_mask.sum()} valid stays. R^2 score: {r2:.4f}")
+    
+    con.unregister('stays_df_tmp')
+    
+    return dict(zip(df['stay_id'], df['los_residual']))
+
+
 def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     logging.info("Connecting to DuckDB and loading MIMIC-III features...")
     con = duckdb.connect()
@@ -1170,8 +1270,9 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     logging.info("Loading Demographics...")
     stays_df = con.query(f"""
         SELECT 
-            s.SUBJECT_ID, s.HADM_ID, s.ICUSTAY_ID as stay_id, s.INTIME, s.OUTTIME,
-            a.ETHNICITY, a.MARITAL_STATUS, a.INSURANCE,
+            s.SUBJECT_ID, s.HADM_ID, s.ICUSTAY_ID as stay_id, s.INTIME, s.OUTTIME, s.FIRST_CAREUNIT, s.LOS,
+            a.ETHNICITY, a.MARITAL_STATUS, a.INSURANCE, a.ADMISSION_TYPE, a.ADMISSION_LOCATION,
+            a.EDREGTIME, a.EDOUTTIME,
             p.GENDER, p.DOB
         FROM read_csv_auto('/home/hanwen/data/mimic/iii/ICUSTAYS.csv', sample_size=-1) s
         JOIN read_csv_auto('/home/hanwen/data/mimic/iii/ADMISSIONS.csv', sample_size=-1) a ON s.HADM_ID = a.HADM_ID
@@ -1223,7 +1324,11 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     stays_df['age'] = (stays_df['INTIME'] - stays_df['DOB']).dt.days / 365.25
     stays_df['age'] = stays_df['age'].clip(0, 100)
     
-    static_encoders, static_dims = {}, {'age': 0}
+    # OLS Expected LOS Residual
+    residual_dict = compute_los_residuals(stays_df, con)
+    stays_df['los_residual'] = stays_df['stay_id'].map(residual_dict).astype(np.float32)
+    
+    static_encoders, static_dims = {}, {'age': 0, 'los_residual': 0}
     for col in ['GENDER', 'MARITAL_STATUS', 'ETHNICITY', 'INSURANCE']:
         stays_df[col] = stays_df[col].fillna('UNKNOWN').astype(str)
         le = LabelEncoder()
@@ -1287,7 +1392,7 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
         X_seq.append(df_seq.values)
         
         # Static
-        X_static.append([stay['age'], stay['GENDER'], stay['MARITAL_STATUS'], stay['ETHNICITY'], stay['INSURANCE']])
+        X_static.append([stay['age'], stay['los_residual'], stay['GENDER'], stay['MARITAL_STATUS'], stay['ETHNICITY'], stay['INSURANCE']])
         
         # Multihot
         mh_vecs = []
@@ -1426,7 +1531,7 @@ def main():
             pickle.dump({'static_dims': static_dims, 'multihot_dims': multihot_dims}, f)
         logging.info(f"Dataset cached to {cache_npz} + {cache_meta}")
     
-    ordered_static_dims = {'age': 0, 'GENDER': static_dims['GENDER'], 'MARITAL_STATUS': static_dims['MARITAL_STATUS'], 
+    ordered_static_dims = {'age': 0, 'los_residual': 0, 'GENDER': static_dims['GENDER'], 'MARITAL_STATUS': static_dims['MARITAL_STATUS'], 
                            'ETHNICITY': static_dims['ETHNICITY'], 'INSURANCE': static_dims['INSURANCE']}
                            
     np.random.seed(42)  # Bug4 fix: set seed for reproducible train/val/test split
