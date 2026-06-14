@@ -1137,9 +1137,42 @@ def main():
         
     with open('output/mimic3_note_embeddings.pkl', 'rb') as f:
         embeddings_dict = pickle.load(f)
-        
-    X_seq, X_static, X_mh, X_note, Y, static_dims, multihot_dims = fetch_mimic3_data(embeddings_dict)
-    if X_seq is None: return
+    
+    # ── Dataset cache: skip 17-min DuckDB pipeline on repeat runs ─────────────
+    cache_npz = 'output/dataset_cache.npz'
+    cache_meta = 'output/dataset_cache_meta.pkl'
+    
+    if os.path.exists(cache_npz) and os.path.exists(cache_meta):
+        logging.info(f"Loading cached dataset from {cache_npz} ...")
+        import time as _time
+        _t0 = _time.time()
+        data = np.load(cache_npz)
+        X_seq    = data['X_seq']
+        X_static = data['X_static']
+        X_mh     = data['X_mh']
+        X_note   = data['X_note']
+        Y        = data['Y']
+        with open(cache_meta, 'rb') as f:
+            meta = pickle.load(f)
+        static_dims   = meta['static_dims']
+        multihot_dims = meta['multihot_dims']
+        logging.info(
+            f"Cache loaded: {len(Y)} samples, "
+            f"X_seq={X_seq.shape}, X_note={X_note.shape} "
+            f"({_time.time()-_t0:.1f}s)"
+        )
+    else:
+        logging.info("No dataset cache found — running full DuckDB pipeline...")
+        X_seq, X_static, X_mh, X_note, Y, static_dims, multihot_dims = fetch_mimic3_data(embeddings_dict)
+        if X_seq is None: return
+        # Save cache for future runs
+        np.savez_compressed(
+            cache_npz,
+            X_seq=X_seq, X_static=X_static, X_mh=X_mh, X_note=X_note, Y=Y,
+        )
+        with open(cache_meta, 'wb') as f:
+            pickle.dump({'static_dims': static_dims, 'multihot_dims': multihot_dims}, f)
+        logging.info(f"Dataset cached to {cache_npz} + {cache_meta}")
     
     ordered_static_dims = {'age': 0, 'GENDER': static_dims['GENDER'], 'MARITAL_STATUS': static_dims['MARITAL_STATUS'], 
                            'ETHNICITY': static_dims['ETHNICITY'], 'INSURANCE': static_dims['INSURANCE']}
