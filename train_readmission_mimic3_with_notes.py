@@ -595,6 +595,181 @@ class GatedFusionWithNotes(nn.Module):
             return logits, g.mean(dim=0)  # avg gate per hidden dim for analysis
         return logits
 
+class TransformerSeqEncoder(nn.Module):
+    def __init__(self, seq_input_dim, hidden_dim, num_layers=2, dropout=0.1, nhead=4):
+        super().__init__()
+        self.seq_proj = nn.Linear(seq_input_dim, hidden_dim)
+        self.pos_encoder = PositionalEncoding(hidden_dim, dropout)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, 
+            nhead=nhead, 
+            dim_feedforward=hidden_dim * 4, 
+            dropout=dropout, 
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
+
+    def forward(self, x_seq, mask_indices=None):
+        x = self.seq_proj(x_seq)  # [B, T, H]
+        if mask_indices is not None:
+            # mask_indices: [B, T] boolean tensor
+            expanded_mask = mask_indices.unsqueeze(-1).expand_as(x)
+            x = torch.where(expanded_mask, self.mask_token, x)
+        x = self.pos_encoder(x)
+        out = self.transformer_encoder(x)
+        return out
+
+class TransformerPretrainer(nn.Module):
+    def __init__(self, encoder, seq_input_dim, hidden_dim):
+        super().__init__()
+        self.encoder = encoder
+        self.reconstruction_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, seq_input_dim)
+        )
+        
+    def forward(self, x_seq, mask_indices):
+        encoded_seq = self.encoder(x_seq, mask_indices)
+        return self.reconstruction_head(encoded_seq)
+
+class PretrainedTransformerCrossModalFusion(nn.Module):
+    def __init__(self, encoder, static_dims=None, multihot_dims=None,
+                 hidden_dim=64, note_dim=4096, nhead=4, num_virtual_tokens=4):
+        super().__init__()
+        self.encoder = encoder
+        self.static_dims = static_dims or {}
+        self.multihot_dims = multihot_dims or {}
+        self.hidden_dim = hidden_dim
+        self.M = num_virtual_tokens
+
+        self.note_proj = nn.Sequential(
+            nn.LayerNorm(note_dim),
+            nn.Linear(note_dim, hidden_dim * 4), nn.GELU(), nn.Dropout(0.2),
+            nn.Linear(hidden_dim * 4, hidden_dim * num_virtual_tokens),
+        )
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim, num_heads=nhead,
+            dropout=0.1, batch_first=True
+        )
+        self.cross_norm  = nn.LayerNorm(hidden_dim)
+        self.cross_ff    = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+        self.cross_ff_norm = nn.LayerNorm(hidden_dim)
+
+        self.temporal_attn = nn.Linear(hidden_dim, 1)
+
+        fused_dim = hidden_dim
+
+        self.has_static = len(self.static_dims) > 0
+        if self.has_static:
+            self.emb_dict = nn.ModuleDict()
+            static_repr_dim = 0
+            for name, vocab_size in self.static_dims.items():
+                if name == 'age': continue
+                emb_dim = max(4, min(16, vocab_size // 2))
+                self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
+                static_repr_dim += emb_dim
+            if 'age' in self.static_dims:
+                static_repr_dim += 1
+            self.static_head = nn.Sequential(
+                nn.Linear(static_repr_dim, 32), nn.ReLU()
+            )
+            fused_dim += 32
+
+        self.has_multihot = len(self.multihot_dims) > 0
+        if self.has_multihot:
+            self.mh_emb_dict = nn.ModuleDict()
+            mh_repr_dim = 0
+            for name, vocab_size in self.multihot_dims.items():
+                emb_dim = max(8, min(32, vocab_size // 4))
+                self.mh_emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
+                mh_repr_dim += emb_dim
+            self.mh_head = nn.Sequential(
+                nn.Linear(mh_repr_dim, 32), nn.ReLU()
+            )
+            fused_dim += 32
+
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(fused_dim),
+            nn.Dropout(0.3),
+            nn.Linear(fused_dim, 64), nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 1)
+        )
+
+    def _multihot_to_embedding(self, x_group, emb):
+        summed = x_group @ emb.weight
+        denom  = torch.clamp(x_group.sum(dim=1, keepdim=True), min=1.0)
+        return summed / denom
+
+    def _encode_static(self, x_static):
+        static_embs, col_idx = [], 0
+        for name, _ in self.static_dims.items():
+            val = x_static[:, col_idx]
+            if name == 'age':
+                static_embs.append(val.unsqueeze(1).float())
+            else:
+                static_embs.append(self.emb_dict[name](val.long()))
+            col_idx += 1
+        return self.static_head(torch.cat(static_embs, dim=1))
+
+    def _encode_multihot(self, x_mh):
+        mh_embs, col_offset = [], 0
+        for name, vocab_size in self.multihot_dims.items():
+            group = x_mh[:, col_offset : col_offset + vocab_size]
+            mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name]))
+            col_offset += vocab_size
+        return self.mh_head(torch.cat(mh_embs, dim=1))
+
+    def forward(self, x_seq, x_static=None, x_mh=None, x_note=None):
+        import torch.nn.functional as F
+
+        # 1. Transformer encode sequence  → H [B, T, d]
+        H = self.encoder(x_seq)
+
+        # 2. Project note → M virtual tokens [B, M, d]
+        if x_note is not None:
+            x_note_norm = F.normalize(x_note, p=2, dim=1)
+            note_tokens = self.note_proj(x_note_norm)          # [B, M*d]
+            note_tokens = note_tokens.view(
+                x_note.shape[0], self.M, self.hidden_dim       # [B, M, d]
+            )
+        else:
+            note_tokens = torch.zeros(
+                H.shape[0], self.M, self.hidden_dim, device=H.device
+            )
+
+        # 3. Cross-Attention  Q=H, K=V=note_tokens
+        attn_out, _ = self.cross_attn(
+            query=H, key=note_tokens, value=note_tokens
+        )                                                        # [B, T, d]
+        H = self.cross_norm(H + attn_out)                       # residual
+        H = self.cross_ff_norm(H + self.cross_ff(H))            # FFN + residual
+
+        # 4. Temporal self-attention pooling  → seq_repr [B, d]
+        temp_w   = torch.softmax(self.temporal_attn(H).squeeze(-1), dim=1)  # [B, T]
+        seq_repr = (H * temp_w.unsqueeze(-1)).sum(dim=1)        # [B, d]
+
+        reprs = [seq_repr]
+
+        if self.has_static and x_static is not None:
+            reprs.append(self._encode_static(x_static))
+
+        if self.has_multihot and x_mh is not None:
+            reprs.append(self._encode_multihot(x_mh))
+
+        fused  = torch.cat(reprs, dim=1) if len(reprs) > 1 else reprs[0]
+        logits = self.classifier(fused).squeeze(-1)
+
+        return logits
+
 def _compute_prauc(y_true, y_score):
     """Compute area under precision-recall curve via trapezoidal rule."""
     y_true = np.asarray(y_true, dtype=np.int64)
@@ -782,6 +957,47 @@ def train_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None,
         )
     
     return model, epoch_history
+
+def pretrain_transformer(encoder, X_seq, seq_dim, hidden_dim, epochs=10, lr=1e-3, batch_size=256, mask_prob=0.15):
+    """
+    Pretrain the TransformerSeqEncoder using masked time-series reconstruction.
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    pretrainer = TransformerPretrainer(encoder, seq_dim, hidden_dim).to(device)
+    
+    tensors = [torch.tensor(X_seq, dtype=torch.float32).to(device)]
+    dataset = TensorDataset(*tensors)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(pretrainer.parameters(), lr=lr)
+    
+    pretrainer.train()
+    logging.info(f"Starting Pretraining for {epochs} epochs (mask_prob={mask_prob})...")
+    
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        for batch in loader:
+            x_s = batch[0]
+            # Create random mask
+            B, T, _ = x_s.shape
+            mask = torch.rand(B, T, device=device) < mask_prob
+            
+            optimizer.zero_grad()
+            # Forward pass
+            reconstructed = pretrainer(x_s, mask)
+            
+            # Compute loss only on masked elements
+            if mask.sum() > 0:
+                loss = criterion(reconstructed[mask], x_s[mask])
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                
+        logging.info(f"Pretrain Epoch {epoch+1}/{epochs} completed - MSE Loss: {epoch_loss / max(1, len(loader)):.4f}")
+        
+    logging.info("Pretraining completed.")
+    return encoder
 
 def _search_best_threshold_f1(y_true, y_prob):
     """Search threshold in [0.01, 0.99] that maximises F1."""
@@ -1313,6 +1529,34 @@ def main():
     torch.save(model_gated.state_dict(), os.path.join(exp_dir, 'model_gated_fusion.pt'))
     logging.info(f"Gated Fusion model saved to {exp_dir}/model_gated_fusion.pt")
     
+    logging.info("6. Training Pretrained Transformer + Cross-Modal Attention...")
+    # 1. Pretrain the encoder
+    pretrained_encoder = TransformerSeqEncoder(seq_input_dim=4, hidden_dim=EXP_CONFIG['hidden_dim'], num_layers=2)
+    pretrained_encoder = pretrain_transformer(
+        pretrained_encoder, X_seq[train_idx], seq_dim=4, hidden_dim=EXP_CONFIG['hidden_dim'],
+        epochs=10, lr=1e-3, batch_size=EXP_CONFIG['batch_size'], mask_prob=0.15
+    )
+    
+    # 2. Instantiate downstream model
+    model_pretrain_cross = PretrainedTransformerCrossModalFusion(
+        encoder=pretrained_encoder,
+        static_dims=ordered_static_dims, multihot_dims=multihot_dims,
+        hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'],
+        nhead=4, num_virtual_tokens=4
+    )
+    
+    # 3. Fine-tune
+    model_pretrain_cross, hist_pretrain_cross = train_model(
+        model_pretrain_cross, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
+        X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
+        epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG['batch_size'],
+        pos_weight=pos_weight_val)
+    all_epoch_histories['pretrained_crossmodal'] = hist_pretrain_cross
+    eval_pretrain_cross = evaluate_model(model_pretrain_cross, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
+    _log_eval_result('Pretrained CrossModal', eval_pretrain_cross)
+    torch.save(model_pretrain_cross.state_dict(), os.path.join(exp_dir, 'model_pretrained_cross_attn.pt'))
+    logging.info(f"Pretrained Cross-Modal Attention model saved to {exp_dir}/model_pretrained_cross_attn.pt")
+    
     # XGBoost natively handles class imbalance via scale_pos_weight (equivalent to pos_weight)
     X_xgb_base = flatten_features(X_seq, X_static, X_mh)
     xgb_base = xgb.XGBClassifier(n_estimators=200, max_depth=6,
@@ -1343,6 +1587,7 @@ def main():
         'transformer_earlyfusion_notes': eval_tf,
         'crossmodal_attention': eval_cross,
         'gated_fusion': eval_gated,
+        'pretrained_crossmodal': eval_pretrain_cross,
         'xgb_base': eval_xgb_base,
         'xgb_notes': eval_xgb_notes,
     }
@@ -1373,7 +1618,7 @@ def main():
         ('XGBoost Base', eval_xgb_base), ('XGBoost + Notes', eval_xgb_notes),
         ('LSTM Base', eval_base), ('LSTM LateFusion', eval_notes),
         ('Transformer EarlyFusion', eval_tf), ('CrossModal Attention', eval_cross),
-        ('Gated Fusion', eval_gated),
+        ('Gated Fusion', eval_gated), ('Transformer Pretrain+CrossModal', eval_pretrain_cross),
     ]:
         m = _m(result)
         logging.info(
@@ -1457,7 +1702,8 @@ def main():
 {_note_row('LSTM LateFusion (+ Notes)', eval_notes)}
 {_note_row('Transformer EarlyFusion (+ Notes)', eval_tf)}
 {_note_row('CrossModal Attn', eval_cross)}
-{_note_row('**Gated Fusion**', eval_gated)}
+{_note_row('Gated Fusion', eval_gated)}
+{_note_row('**Pretrain+CrossModal**', eval_pretrain_cross)}
 
 ## Ablation Study Results — Test Set @ Fixed Threshold 0.5
 | Model | Threshold | AUROC | PRAUC | Precision | Recall | F1 | Brier |
@@ -1468,7 +1714,8 @@ def main():
 {_note_row_05('LSTM LateFusion (+ Notes)', eval_notes)}
 {_note_row_05('Transformer EarlyFusion (+ Notes)', eval_tf)}
 {_note_row_05('CrossModal Attn', eval_cross)}
-{_note_row_05('**Gated Fusion**', eval_gated)}
+{_note_row_05('Gated Fusion', eval_gated)}
+{_note_row_05('**Pretrain+CrossModal**', eval_pretrain_cross)}
 
 ### Note Embedding Impact (AUROC)
 - XGBoost: notes Δ AUC = {_m(eval_xgb_notes)['roc_auc'] - _m(eval_xgb_base)['roc_auc']:+.4f}
@@ -1484,6 +1731,7 @@ def main():
 | `model_tf_notes.pt`    | Early Fusion Transformer state_dict |
 | `model_cross_attn.pt`  | CrossModal Attention Fusion state_dict |
 | `model_gated_fusion.pt` | Gated Fusion state_dict |
+| `model_pretrained_cross_attn.pt` | Pretrained CrossModal Fusion state_dict |
 | `model_xgb_base.json`  | XGBoost Base (XGBoost native format) |
 | `model_xgb_notes.json` | XGBoost + Notes (XGBoost native format) |
 | `seq_scaler.pkl`       | StandardScaler for sequence features (required for inference) |
