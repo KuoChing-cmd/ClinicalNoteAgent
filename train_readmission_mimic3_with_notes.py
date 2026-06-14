@@ -943,7 +943,7 @@ def build_multihot_features(con, table, id_col, val_col, valid_ids, top_k, trim=
         
     return feature_dict, len(vocab)
 
-def fetch_mimic3_data(embeddings_dict):
+def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     logging.info("Connecting to DuckDB and loading MIMIC-III features...")
     con = duckdb.connect()
     
@@ -1075,9 +1075,11 @@ def fetch_mimic3_data(embeddings_dict):
         mh_vecs.append(rx_dict.get(hadm, np.zeros(rx_dim, dtype=np.float32)))
         X_mh.append(np.concatenate(mh_vecs))
         
-        val = embeddings_dict.get(sid, np.zeros(4096, dtype=np.float32))
-        if isinstance(val, dict):
-            val = val.get('embedding', np.zeros(4096, dtype=np.float32))
+        val = embeddings_dict.get(sid)
+        if val is None:
+            val = np.zeros(note_emb_dim, dtype=np.float32)
+        elif isinstance(val, dict):
+            val = val.get('embedding', np.zeros(note_emb_dim, dtype=np.float32))
         X_note.append(np.array(val, dtype=np.float32))
         
         Y.append(stay['readmitted'])
@@ -1094,10 +1096,12 @@ EXP_CONFIG = {
     "lr":          1e-3,
     "batch_size":  256,
     "hidden_dim":  64,
-    "note_dim":    4096,
-    "top_k_codes": 64,          # top-K for ICD/DRG/Proc/Rx multi-hot
+    "note_dim":    None,         # auto-detected from embeddings (768 for ClinicalBERT, 4096 for Llama)
+    "top_k_codes": 64,           # top-K for ICD/DRG/Proc/Rx multi-hot
     "xgb_n_est":   200,
     "xgb_depth":   6,
+    # Note embedding selection
+    "note_embedding_type": "clinicalbert",  # "clinicalbert" (768d) or "llama" (4096d)
     # Optimizations enabled in this run
     "opt_seq_norm":    True,     # ① StandardScaler on sequence features
     "opt_cosine_lr":   True,     # ② CosineAnnealingLR scheduler
@@ -1116,14 +1120,26 @@ def make_exp_dir() -> str:
         f"{'_seqnorm' if EXP_CONFIG['opt_seq_norm'] else ''}"
         f"{'_cosinelr' if EXP_CONFIG['opt_cosine_lr'] else ''}"
         f"{'_posw' if EXP_CONFIG['opt_pos_weight'] else ''}"
+        f"_{EXP_CONFIG['note_embedding_type']}"
     )
     exp_dir = os.path.join('output', f"{ts}_{tag}")
     os.makedirs(exp_dir, exist_ok=True)
     return exp_dir
 
 def main():
-    if not os.path.exists('output/mimic3_note_embeddings.pkl'):
-        logging.error("Embeddings file not found! Please run preprocess_note_embeddings.py first.")
+    # ── Determine embedding file ──────────────────────────────────────────────
+    emb_type = EXP_CONFIG['note_embedding_type']
+    if emb_type == 'clinicalbert':
+        emb_path = 'output/mimic3_note_embeddings_clinicalbert.pkl'
+    else:
+        emb_path = 'output/mimic3_note_embeddings.pkl'
+    
+    if not os.path.exists(emb_path):
+        logging.error(f"Embeddings file not found: {emb_path}")
+        if emb_type == 'clinicalbert':
+            logging.error("Run preprocess_clinicalbert_embeddings.py first.")
+        else:
+            logging.error("Run preprocess_note_embeddings.py first.")
         return
     
     # Create the experiment directory for this run
@@ -1134,13 +1150,25 @@ def main():
     exp_log_handler = logging.FileHandler(os.path.join(exp_dir, 'training.log'))
     exp_log_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
     logging.getLogger().addHandler(exp_log_handler)
-        
-    with open('output/mimic3_note_embeddings.pkl', 'rb') as f:
+    
+    logging.info(f"Note embedding type: {emb_type} (from {emb_path})")
+    with open(emb_path, 'rb') as f:
         embeddings_dict = pickle.load(f)
     
+    # Auto-detect embedding dimension from data
+    sample_val = next(iter(embeddings_dict.values()))
+    if isinstance(sample_val, dict):
+        note_dim_detected = len(sample_val.get('embedding', []))
+    else:
+        note_dim_detected = len(sample_val)
+    EXP_CONFIG['note_dim'] = note_dim_detected
+    logging.info(f"Auto-detected note_dim = {note_dim_detected}")
+    
     # ── Dataset cache: skip 17-min DuckDB pipeline on repeat runs ─────────────
-    cache_npz = 'output/dataset_cache.npz'
-    cache_meta = 'output/dataset_cache_meta.pkl'
+    # Cache is per embedding type to avoid conflicts
+    cache_tag = f'_{emb_type}' if emb_type != 'llama' else ''
+    cache_npz = f'output/dataset_cache{cache_tag}.npz'
+    cache_meta = f'output/dataset_cache{cache_tag}_meta.pkl'
     
     if os.path.exists(cache_npz) and os.path.exists(cache_meta):
         logging.info(f"Loading cached dataset from {cache_npz} ...")
@@ -1163,7 +1191,9 @@ def main():
         )
     else:
         logging.info("No dataset cache found — running full DuckDB pipeline...")
-        X_seq, X_static, X_mh, X_note, Y, static_dims, multihot_dims = fetch_mimic3_data(embeddings_dict)
+        X_seq, X_static, X_mh, X_note, Y, static_dims, multihot_dims = fetch_mimic3_data(
+            embeddings_dict, note_emb_dim=note_dim_detected
+        )
         if X_seq is None: return
         # Save cache for future runs
         np.savez_compressed(
@@ -1225,7 +1255,7 @@ def main():
     logging.info(f"Base LSTM model saved to {exp_dir}/model_lstm_base.pt")
     
     logging.info("2. Training Late Fusion LSTM (Base + LLM Notes Embedding)...")
-    model_notes = LSTMLateFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=4096, use_notes=True)
+    model_notes = LSTMLateFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True)
     model_notes, hist_notes = train_model(
         model_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
@@ -1238,7 +1268,7 @@ def main():
     logging.info(f"Late Fusion LSTM model saved to {exp_dir}/model_lstm_notes.pt")
     
     logging.info("3. Training Early Fusion Transformer (Base + LLM Notes Embedding)...")
-    model_tf_notes = TransformerEarlyFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=4096, use_notes=True)
+    model_tf_notes = TransformerEarlyFusionWithNotes(seq_dim=4, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True)
     model_tf_notes, hist_tf = train_model(
         model_tf_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
