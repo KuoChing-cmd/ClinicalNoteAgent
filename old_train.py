@@ -29,14 +29,14 @@ import math
 # PyTorch Model Architecture
 # ---------------------------------------------------------
 class LSTMLateFusionWithNotes(nn.Module):
-    def __init__(self, seq_dim, static_dims=None, multihot_dims=None, hidden_dim=64, note_dim=4096, use_notes=True, num_layers=4, dropout=0.2):
+    def __init__(self, seq_dim, static_dims=None, multihot_dims=None, hidden_dim=64, note_dim=4096, use_notes=True):
         super().__init__()
         self.use_notes = use_notes
         self.static_dims = static_dims or {}
         self.multihot_dims = multihot_dims or {}
         
         # 1. Sequence processing
-        self.lstm = nn.LSTM(input_size=seq_dim, hidden_size=hidden_dim, batch_first=True, dropout=dropout, num_layers=num_layers)
+        self.lstm = nn.LSTM(input_size=seq_dim, hidden_size=hidden_dim, batch_first=True, dropout=0.1, num_layers=2)
         self.attn = nn.Linear(hidden_dim, 1)
         
         fused_dim = hidden_dim
@@ -47,13 +47,16 @@ class LSTMLateFusionWithNotes(nn.Module):
             self.emb_dict = nn.ModuleDict()
             static_repr_dim = 0
             for name, vocab_size in self.static_dims.items():
-                if self.static_dims[name] == 0:  
+                if name in ['age', 'los_residual']:  
                     continue
                 emb_dim = max(4, min(16, vocab_size // 2))
                 self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
                 static_repr_dim += emb_dim
                 
-            static_repr_dim += sum(1 for v in self.static_dims.values() if v == 0)
+            if 'age' in self.static_dims:
+                static_repr_dim += 1
+            if 'los_residual' in self.static_dims:
+                static_repr_dim += 1
                 
             self.static_head = nn.Sequential(
                 nn.Linear(static_repr_dim, 32),
@@ -114,7 +117,7 @@ class LSTMLateFusionWithNotes(nn.Module):
             col_idx = 0
             for name, _ in self.static_dims.items():
                 val = x_static[:, col_idx]
-                if self.static_dims[name] == 0:
+                if name in ['age', 'los_residual']:
                     static_embs.append(val.unsqueeze(1).float())
                 else:
                     static_embs.append(self.emb_dict[name](val.long()))
@@ -156,7 +159,7 @@ class PositionalEncoding(nn.Module):
         return x.transpose(0, 1)
 
 class TransformerEarlyFusionWithNotes(nn.Module):
-    def __init__(self, seq_dim, static_dims=None, multihot_dims=None, hidden_dim=64, note_dim=4096, use_notes=True, num_layers=4, nhead=8, dropout=0.2):
+    def __init__(self, seq_dim, static_dims=None, multihot_dims=None, hidden_dim=64, note_dim=4096, use_notes=True, nhead=4, num_layers=2):
         super().__init__()
         self.use_notes = use_notes
         self.static_dims = static_dims or {}
@@ -164,9 +167,9 @@ class TransformerEarlyFusionWithNotes(nn.Module):
         
         # 1. Sequence processing (Transformer)
         self.seq_proj = nn.Linear(seq_dim, hidden_dim)
-        self.pos_encoder = PositionalEncoding(hidden_dim, dropout=dropout)
+        self.pos_encoder = PositionalEncoding(hidden_dim, dropout=0.1)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        encoder_layers = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead, dim_feedforward=hidden_dim*4, dropout=dropout, batch_first=True, norm_first=True)
+        encoder_layers = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead, dim_feedforward=hidden_dim*4, dropout=0.1, batch_first=True, norm_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
         
         fused_dim = hidden_dim # We'll just use CLS token output
@@ -177,11 +180,14 @@ class TransformerEarlyFusionWithNotes(nn.Module):
             self.emb_dict = nn.ModuleDict()
             static_repr_dim = 0
             for name, vocab_size in self.static_dims.items():
-                if self.static_dims[name] == 0: continue
+                if name in ['age', 'los_residual']: continue
                 emb_dim = max(4, min(16, vocab_size // 2))
                 self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
                 static_repr_dim += emb_dim
-            static_repr_dim += sum(1 for v in self.static_dims.values() if v == 0)
+            if 'age' in self.static_dims:
+                static_repr_dim += 1
+            if 'los_residual' in self.static_dims:
+                static_repr_dim += 1
             self.static_head = nn.Sequential(nn.Linear(static_repr_dim, hidden_dim), nn.ReLU())
             
         # 3. High-Dim Sparse Features (ICD, DRG, etc.)
@@ -230,7 +236,7 @@ class TransformerEarlyFusionWithNotes(nn.Module):
             col_idx = 0
             for name, _ in self.static_dims.items():
                 val = x_static[:, col_idx]
-                if self.static_dims[name] == 0:
+                if name in ['age', 'los_residual']:
                     static_embs.append(val.unsqueeze(1).float())
                 else:
                     static_embs.append(self.emb_dict[name](val.long()))
@@ -287,8 +293,8 @@ class CrossModalAttnFusion(nn.Module):
     steps are most influenced by which note concepts.
     """
     def __init__(self, seq_dim, static_dims=None, multihot_dims=None,
-                 hidden_dim=64, note_dim=4096, nhead=8,
-                 num_virtual_tokens=4, num_lstm_layers=4, dropout=0.2):
+                 hidden_dim=64, note_dim=4096, nhead=4,
+                 num_virtual_tokens=4, num_lstm_layers=2):
         super().__init__()
         self.static_dims   = static_dims   or {}
         self.multihot_dims = multihot_dims or {}
@@ -299,7 +305,7 @@ class CrossModalAttnFusion(nn.Module):
         self.lstm = nn.LSTM(
             input_size=seq_dim, hidden_size=hidden_dim,
             num_layers=num_lstm_layers, batch_first=True,
-            dropout=dropout if num_lstm_layers > 1 else 0.0
+            dropout=0.1 if num_lstm_layers > 1 else 0.0
         )
 
         # ── 2. Note → M virtual tokens ────────────────────────────────────────
@@ -314,7 +320,7 @@ class CrossModalAttnFusion(nn.Module):
         # ── 3. Cross-Attention block (seq queries ← note keys/values) ─────────
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=hidden_dim, num_heads=nhead,
-            dropout=dropout, batch_first=True
+            dropout=0.1, batch_first=True
         )
         self.cross_norm  = nn.LayerNorm(hidden_dim)   # post-attention norm
         self.cross_ff    = nn.Sequential(             # position-wise FFN
@@ -335,11 +341,14 @@ class CrossModalAttnFusion(nn.Module):
             self.emb_dict      = nn.ModuleDict()
             static_repr_dim    = 0
             for name, vocab_size in self.static_dims.items():
-                if self.static_dims[name] == 0: continue
+                if name in ['age', 'los_residual']: continue
                 emb_dim = max(4, min(16, vocab_size // 2))
                 self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
                 static_repr_dim += emb_dim
-            static_repr_dim += sum(1 for v in self.static_dims.values() if v == 0)
+            if 'age' in self.static_dims:
+                static_repr_dim += 1
+            if 'los_residual' in self.static_dims:
+                static_repr_dim += 1
             self.static_head = nn.Sequential(
                 nn.Linear(static_repr_dim, 32), nn.ReLU()
             )
@@ -378,7 +387,7 @@ class CrossModalAttnFusion(nn.Module):
         static_embs, col_idx = [], 0
         for name, _ in self.static_dims.items():
             val = x_static[:, col_idx]
-            if self.static_dims[name] == 0:
+            if name in ['age', 'los_residual']:
                 static_embs.append(val.unsqueeze(1).float())
             else:
                 static_embs.append(self.emb_dict[name](val.long()))
@@ -466,7 +475,7 @@ class GatedFusionWithNotes(nn.Module):
     noisy or redundant text features from hurting performance.
     """
     def __init__(self, seq_dim, static_dims=None, multihot_dims=None,
-                 hidden_dim=64, note_dim=4096, num_lstm_layers=4, dropout=0.2):
+                 hidden_dim=64, note_dim=4096, num_lstm_layers=2):
         super().__init__()
         self.static_dims   = static_dims   or {}
         self.multihot_dims = multihot_dims or {}
@@ -476,7 +485,7 @@ class GatedFusionWithNotes(nn.Module):
         self.lstm = nn.LSTM(
             input_size=seq_dim, hidden_size=hidden_dim,
             num_layers=num_lstm_layers, batch_first=True,
-            dropout=dropout if num_lstm_layers > 1 else 0.0
+            dropout=0.1 if num_lstm_layers > 1 else 0.0
         )
         self.attn = nn.Linear(hidden_dim, 1)
 
@@ -503,11 +512,14 @@ class GatedFusionWithNotes(nn.Module):
             self.emb_dict = nn.ModuleDict()
             static_repr_dim = 0
             for name, vocab_size in self.static_dims.items():
-                if self.static_dims[name] == 0: continue
+                if name in ['age', 'los_residual']: continue
                 emb_dim = max(4, min(16, vocab_size // 2))
                 self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
                 static_repr_dim += emb_dim
-            static_repr_dim += sum(1 for v in self.static_dims.values() if v == 0)
+            if 'age' in self.static_dims:
+                static_repr_dim += 1
+            if 'los_residual' in self.static_dims:
+                static_repr_dim += 1
             self.static_head = nn.Sequential(
                 nn.Linear(static_repr_dim, 32), nn.ReLU()
             )
@@ -568,7 +580,7 @@ class GatedFusionWithNotes(nn.Module):
             static_embs, col_idx = [], 0
             for name, _ in self.static_dims.items():
                 val = x_static[:, col_idx]
-                if self.static_dims[name] == 0:
+                if name in ['age', 'los_residual']:
                     static_embs.append(val.unsqueeze(1).float())
                 else:
                     static_embs.append(self.emb_dict[name](val.long()))
@@ -592,7 +604,7 @@ class GatedFusionWithNotes(nn.Module):
         return logits
 
 class TransformerSeqEncoder(nn.Module):
-    def __init__(self, seq_input_dim, hidden_dim, num_layers=4, nhead=8, dropout=0.2):
+    def __init__(self, seq_input_dim, hidden_dim, num_layers=2, dropout=0.1, nhead=4):
         super().__init__()
         self.seq_proj = nn.Linear(seq_input_dim, hidden_dim)
         self.pos_encoder = PositionalEncoding(hidden_dim, dropout)
@@ -633,7 +645,7 @@ class TransformerPretrainer(nn.Module):
 
 class PretrainedTransformerCrossModalFusion(nn.Module):
     def __init__(self, encoder, static_dims=None, multihot_dims=None,
-                 hidden_dim=64, note_dim=4096, nhead=8, num_virtual_tokens=4, dropout=0.2):
+                 hidden_dim=64, note_dim=4096, nhead=4, num_virtual_tokens=4):
         super().__init__()
         self.encoder = encoder
         self.static_dims = static_dims or {}
@@ -649,7 +661,7 @@ class PretrainedTransformerCrossModalFusion(nn.Module):
 
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=hidden_dim, num_heads=nhead,
-            dropout=dropout, batch_first=True
+            dropout=0.1, batch_first=True
         )
         self.cross_norm  = nn.LayerNorm(hidden_dim)
         self.cross_ff    = nn.Sequential(
@@ -668,11 +680,14 @@ class PretrainedTransformerCrossModalFusion(nn.Module):
             self.emb_dict = nn.ModuleDict()
             static_repr_dim = 0
             for name, vocab_size in self.static_dims.items():
-                if self.static_dims[name] == 0: continue
+                if name in ['age', 'los_residual']: continue
                 emb_dim = max(4, min(16, vocab_size // 2))
                 self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
                 static_repr_dim += emb_dim
-            static_repr_dim += sum(1 for v in self.static_dims.values() if v == 0)
+            if 'age' in self.static_dims:
+                static_repr_dim += 1
+            if 'los_residual' in self.static_dims:
+                static_repr_dim += 1
             self.static_head = nn.Sequential(
                 nn.Linear(static_repr_dim, 32), nn.ReLU()
             )
@@ -708,7 +723,7 @@ class PretrainedTransformerCrossModalFusion(nn.Module):
         static_embs, col_idx = [], 0
         for name, _ in self.static_dims.items():
             val = x_static[:, col_idx]
-            if self.static_dims[name] == 0:
+            if name in ['age', 'los_residual']:
                 static_embs.append(val.unsqueeze(1).float())
             else:
                 static_embs.append(self.emb_dict[name](val.long()))
@@ -785,7 +800,7 @@ def _compute_prauc(y_true, y_score):
 def train_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None,
                 X_seq_val=None, Y_val=None, X_static_val=None, X_mh_val=None, X_note_val=None,
                 epochs=12, lr=1e-3, batch_size=256, pos_weight=None,
-                early_stop_patience=30, early_stop_min_delta=1e-4):
+                early_stop_patience=15, early_stop_min_delta=1e-4):
     """
     Train a PyTorch model with:
       - Optimization ②: CosineAnnealingLR learning rate scheduling
@@ -1154,8 +1169,8 @@ def build_multihot_features(con, table, id_col, val_col, valid_ids, top_k, trim=
         
     return feature_dict, len(vocab)
 
-def enrich_stays_with_features(stays_df, con):
-    logging.info("Computing additional features for stays...")
+def compute_los_residuals(stays_df, con):
+    logging.info("Computing OLS-based Expected LOS Residuals on global dataset...")
     
     # Register temporary table for DuckDB
     con.register('stays_df_tmp', stays_df[['HADM_ID', 'stay_id', 'INTIME']])
@@ -1199,9 +1214,49 @@ def enrich_stays_with_features(stays_df, con):
     ed_wait = (df['EDOUTTIME'] - df['EDREGTIME']).dt.total_seconds() / 3600.0
     df['log_ed_wait'] = np.log1p(np.where((ed_wait > 0) & (ed_wait < 240), ed_wait, 0))
     
+    # Target
+    df['actual_los'] = df['LOS'].fillna((pd.to_datetime(df['OUTTIME']) - pd.to_datetime(df['INTIME'])).dt.total_seconds() / 86400.0)
+    df['Y'] = np.log1p(df['actual_los'].clip(lower=0))
+    
+    from sklearn.preprocessing import OneHotEncoder
+    from sklearn.linear_model import LinearRegression
+    
+    cat_cols = ['ADMISSION_TYPE', 'ADMISSION_LOCATION', 'INSURANCE', 'FIRST_CAREUNIT', 'GENDER']
+    for col in cat_cols:
+        df[col] = df[col].astype(str)
+        top8 = df[col].value_counts().nlargest(8).index
+        df[col] = np.where(df[col].isin(top8), df[col], 'OTHER')
+    
+    ohe = OneHotEncoder(sparse_output=False, drop='first')
+    cat_features = ohe.fit_transform(df[cat_cols])
+    
+    # Calculate age for OLS
+    df['DOB'] = pd.to_datetime(df['DOB'], errors='coerce')
+    df['age'] = (df['INTIME'] - df['DOB']).dt.days / 365.25
+    df['age'] = df['age'].clip(0, 100)
+    
+    num_features = df[['age', 'pre_icu_transfers', 'surg_count', 'surg_flag', 'log_surg_gap', 'log_ed_wait']].fillna(0).values
+    
+    X = np.hstack([num_features, cat_features])
+    Y = df['Y'].values
+    
+    valid_mask = ~np.isnan(Y)
+    
+    model = LinearRegression()
+    if valid_mask.sum() > 0:
+        model.fit(X[valid_mask], Y[valid_mask])
+        Y_pred = model.predict(X)
+        df['los_residual'] = np.where(valid_mask, Y - Y_pred, 0.0)
+        r2 = model.score(X[valid_mask], Y[valid_mask])
+    else:
+        df['los_residual'] = 0.0
+        r2 = 0.0
+        
+    logging.info(f"  OLS Model trained on {valid_mask.sum()} valid stays. R^2 score: {r2:.4f}")
+    
     con.unregister('stays_df_tmp')
     
-    return df
+    return dict(zip(df['stay_id'], df['los_residual']))
 
 
 def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
@@ -1269,16 +1324,12 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     stays_df['age'] = (stays_df['INTIME'] - stays_df['DOB']).dt.days / 365.25
     stays_df['age'] = stays_df['age'].clip(0, 100)
     
-    # Extract original features instead of fitting OLS
-    stays_df = enrich_stays_with_features(stays_df, con)
+    # OLS Expected LOS Residual
+    residual_dict = compute_los_residuals(stays_df, con)
+    stays_df['los_residual'] = stays_df['stay_id'].map(residual_dict).astype(np.float32)
     
-    cont_cols = ['age', 'pre_icu_transfers', 'surg_count', 'log_surg_gap', 'log_ed_wait']
-    cat_cols = ['GENDER', 'MARITAL_STATUS', 'ETHNICITY', 'INSURANCE', 'ADMISSION_TYPE', 'ADMISSION_LOCATION', 'FIRST_CAREUNIT', 'surg_flag']
-    
-    static_encoders, static_dims = {}, {}
-    for col in cont_cols:
-        static_dims[col] = 0
-    for col in cat_cols:
+    static_encoders, static_dims = {}, {'age': 0, 'los_residual': 0}
+    for col in ['GENDER', 'MARITAL_STATUS', 'ETHNICITY', 'INSURANCE']:
         stays_df[col] = stays_df[col].fillna('UNKNOWN').astype(str)
         le = LabelEncoder()
         stays_df[col] = le.fit_transform(stays_df[col])
@@ -1341,7 +1392,7 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
         X_seq.append(df_seq.values)
         
         # Static
-        X_static.append([stay[col] for col in cont_cols + cat_cols])
+        X_static.append([stay['age'], stay['los_residual'], stay['GENDER'], stay['MARITAL_STATUS'], stay['ETHNICITY'], stay['INSURANCE']])
         
         # Multihot
         mh_vecs = []
@@ -1369,18 +1420,13 @@ def flatten_features(X_seq, X_static, X_mh):
 # Edit these values to configure a run. The exp dir name is auto-generated.
 EXP_CONFIG = {
     "epochs":      200,
-    "lr":          5e-4,         # ↓ from 1e-3; smaller LR to reduce overfitting / allow longer convergence
+    "lr":          1e-3,
     "batch_size":  256,
-    "hidden_dim":  128,
-    "num_layers":  4,            # for LSTM
-    "tf_num_layers": 2,          # ↓ from 4; reduce Transformer depth
-    "tf_nhead":    4,            # ↓ from 8; reduce Transformer heads
-    "dropout":     0.3,          # ↑ from 0.2; add more regularization globally
+    "hidden_dim":  64,
     "note_dim":    None,         # auto-detected from embeddings (768 for ClinicalBERT, 4096 for Llama)
     "top_k_codes": 64,           # top-K for ICD/DRG/Proc/Rx multi-hot
     "xgb_n_est":   200,
     "xgb_depth":   6,
-    "early_stop_patience": 30,   # ↑ from 15; give model more epochs to find better minimum
     # Note embedding selection
     "note_embedding_type": "clinicalbert",  # "clinicalbert" (768d) or "llama" (4096d)
     # Optimizations enabled in this run
@@ -1485,7 +1531,8 @@ def main():
             pickle.dump({'static_dims': static_dims, 'multihot_dims': multihot_dims}, f)
         logging.info(f"Dataset cached to {cache_npz} + {cache_meta}")
     
-    ordered_static_dims = static_dims
+    ordered_static_dims = {'age': 0, 'los_residual': 0, 'GENDER': static_dims['GENDER'], 'MARITAL_STATUS': static_dims['MARITAL_STATUS'], 
+                           'ETHNICITY': static_dims['ETHNICITY'], 'INSURANCE': static_dims['INSURANCE']}
                            
     np.random.seed(42)  # Bug4 fix: set seed for reproducible train/val/test split
     idx = np.random.permutation(len(Y))
@@ -1522,12 +1569,12 @@ def main():
     logging.info("\n================ ABLATION STUDY: CLINICAL ALIGNMENT ================")
     
     logging.info("1. Training Base LSTM (Clinical Series + Demographics + ICD/DRG/Proc/Rx, NO Notes)...")
-    model_base = LSTMLateFusionWithNotes(seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims, use_notes=False, num_layers=EXP_CONFIG['num_layers'], dropout=EXP_CONFIG['dropout'])
+    model_base = LSTMLateFusionWithNotes(seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims, use_notes=False)
     model_base, hist_base = train_model(
         model_base, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx],
         epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG['batch_size'],
-        early_stop_patience=EXP_CONFIG['early_stop_patience'], pos_weight=pos_weight_val)
+        pos_weight=pos_weight_val)
     all_epoch_histories['lstm_base'] = hist_base
     eval_base = evaluate_model(model_base, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx])
     _log_eval_result('LSTM Base', eval_base)
@@ -1535,12 +1582,12 @@ def main():
     logging.info(f"Base LSTM model saved to {exp_dir}/model_lstm_base.pt")
     
     logging.info("2. Training Late Fusion LSTM (Base + LLM Notes Embedding)...")
-    model_notes = LSTMLateFusionWithNotes(seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True, num_layers=EXP_CONFIG['num_layers'], dropout=EXP_CONFIG['dropout'])
+    model_notes = LSTMLateFusionWithNotes(seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True)
     model_notes, hist_notes = train_model(
         model_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
         epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG['batch_size'],
-        early_stop_patience=EXP_CONFIG['early_stop_patience'], pos_weight=pos_weight_val)
+        pos_weight=pos_weight_val)
     all_epoch_histories['lstm_latefusion_notes'] = hist_notes
     eval_notes = evaluate_model(model_notes, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
     _log_eval_result('LSTM LateFusion', eval_notes)
@@ -1548,12 +1595,12 @@ def main():
     logging.info(f"Late Fusion LSTM model saved to {exp_dir}/model_lstm_notes.pt")
     
     logging.info("3. Training Early Fusion Transformer (Base + LLM Notes Embedding)...")
-    model_tf_notes = TransformerEarlyFusionWithNotes(seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True, num_layers=EXP_CONFIG['tf_num_layers'], nhead=EXP_CONFIG['tf_nhead'], dropout=EXP_CONFIG['dropout'])
+    model_tf_notes = TransformerEarlyFusionWithNotes(seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True)
     model_tf_notes, hist_tf = train_model(
         model_tf_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
         epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG['batch_size'],
-        early_stop_patience=EXP_CONFIG['early_stop_patience'], pos_weight=pos_weight_val)
+        pos_weight=pos_weight_val)
     all_epoch_histories['transformer_earlyfusion_notes'] = hist_tf
     eval_tf = evaluate_model(model_tf_notes, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
     _log_eval_result('Transformer EarlyFusion', eval_tf)
@@ -1564,13 +1611,13 @@ def main():
     model_cross = CrossModalAttnFusion(
         seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims,
         hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'],
-        nhead=EXP_CONFIG["tf_nhead"], num_virtual_tokens=2, num_lstm_layers=EXP_CONFIG["num_layers"], dropout=EXP_CONFIG["dropout"]
+        nhead=4, num_virtual_tokens=4
     )
     model_cross, hist_cross = train_model(
         model_cross, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
         epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG['batch_size'],
-        early_stop_patience=EXP_CONFIG['early_stop_patience'], pos_weight=pos_weight_val)
+        pos_weight=pos_weight_val)
     all_epoch_histories['crossmodal_attention'] = hist_cross
     eval_cross = evaluate_model(model_cross, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
     _log_eval_result('CrossModal Attention', eval_cross)
@@ -1580,13 +1627,13 @@ def main():
     logging.info("5. Training Gated Fusion (LSTM × Note Gated Blend)...")
     model_gated = GatedFusionWithNotes(
         seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims,
-        hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'], num_lstm_layers=EXP_CONFIG["num_layers"], dropout=EXP_CONFIG["dropout"]
+        hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'],
     )
     model_gated, hist_gated = train_model(
         model_gated, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
         epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG['batch_size'],
-        early_stop_patience=EXP_CONFIG['early_stop_patience'], pos_weight=pos_weight_val)
+        pos_weight=pos_weight_val)
     all_epoch_histories['gated_fusion'] = hist_gated
     eval_gated = evaluate_model(model_gated, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
     _log_eval_result('Gated Fusion', eval_gated)
@@ -1595,7 +1642,7 @@ def main():
     
     logging.info("6. Training Pretrained Transformer + Cross-Modal Attention...")
     # 1. Pretrain the encoder
-    pretrained_encoder = TransformerSeqEncoder(seq_input_dim=8, hidden_dim=EXP_CONFIG['hidden_dim'], num_layers=EXP_CONFIG['tf_num_layers'], nhead=EXP_CONFIG['tf_nhead'], dropout=EXP_CONFIG['dropout'])
+    pretrained_encoder = TransformerSeqEncoder(seq_input_dim=8, hidden_dim=EXP_CONFIG['hidden_dim'], num_layers=2)
     pretrained_encoder = pretrain_transformer(
         pretrained_encoder, X_seq[train_idx], seq_dim=8, hidden_dim=EXP_CONFIG['hidden_dim'],
         epochs=10, lr=1e-3, batch_size=EXP_CONFIG['batch_size'], mask_prob=0.15
@@ -1605,7 +1652,8 @@ def main():
     model_pretrain_cross = PretrainedTransformerCrossModalFusion(
         encoder=pretrained_encoder,
         static_dims=ordered_static_dims, multihot_dims=multihot_dims,
-        hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'], nhead=EXP_CONFIG["tf_nhead"], dropout=EXP_CONFIG["dropout"], num_virtual_tokens=2
+        hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'],
+        nhead=4, num_virtual_tokens=4
     )
     
     # 3. Fine-tune
@@ -1613,7 +1661,7 @@ def main():
         model_pretrain_cross, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
         epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG['batch_size'],
-        early_stop_patience=EXP_CONFIG['early_stop_patience'], pos_weight=pos_weight_val)
+        pos_weight=pos_weight_val)
     all_epoch_histories['pretrained_crossmodal'] = hist_pretrain_cross
     eval_pretrain_cross = evaluate_model(model_pretrain_cross, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note[test_idx])
     _log_eval_result('Pretrained CrossModal', eval_pretrain_cross)
@@ -1740,15 +1788,11 @@ def main():
 | lr         | {EXP_CONFIG['lr']} |
 | batch_size | {EXP_CONFIG['batch_size']} |
 | hidden_dim | {EXP_CONFIG['hidden_dim']} |
-| num_layers | {EXP_CONFIG['num_layers']} |
-| tf_num_layers | {EXP_CONFIG['tf_num_layers']} |
-| tf_nhead   | {EXP_CONFIG['tf_nhead']} |
-| dropout    | {EXP_CONFIG['dropout']} |
 | note_dim   | {EXP_CONFIG['note_dim']} |
 | top_k_codes | {EXP_CONFIG['top_k_codes']} |
 | xgb_n_estimators | {EXP_CONFIG['xgb_n_est']} |
 | xgb_max_depth    | {EXP_CONFIG['xgb_depth']} |
-| early_stop_patience | {EXP_CONFIG['early_stop_patience']} |
+| early_stop_patience | 15 |
 | early_stop_min_delta | 1e-4 |
 
 ## Optimizations Applied
@@ -1757,7 +1801,7 @@ def main():
 | ① | Sequence StandardScaler (fit on train only) | {'✅' if EXP_CONFIG['opt_seq_norm'] else '❌'} |
 | ② | CosineAnnealingLR scheduler (eta_min = lr×0.01) | {'✅' if EXP_CONFIG['opt_cosine_lr'] else '❌'} |
 | ③ | BCEWithLogitsLoss pos_weight / XGB scale_pos_weight | {'✅' if EXP_CONFIG['opt_pos_weight'] else '❌'} |
-| ④ | Early Stopping (val_loss, patience={EXP_CONFIG['early_stop_patience']}) | ✅ |
+| ④ | Early Stopping (val_loss, patience=15) | ✅ |
 | ⑤ | Best F1 threshold search | ✅ |
 
 ## Ablation Study Results — Test Set @ Best F1 Threshold
