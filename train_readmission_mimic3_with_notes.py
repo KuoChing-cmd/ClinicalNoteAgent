@@ -23,6 +23,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from tqdm import tqdm
 import xgboost as xgb
+import lightgbm as lgb
 import math
 
 # ---------------------------------------------------------
@@ -1436,6 +1437,8 @@ EXP_CONFIG = {
     "top_k_codes": 64,           # top-K for ICD/DRG/Proc/Rx multi-hot
     "xgb_n_est":   200,
     "xgb_depth":   6,
+    "lgb_n_est":   200,
+    "lgb_depth":   6,
     "early_stop_patience": 30,   # ↑ from 15; give model more epochs to find better minimum
     # Note embedding selection
     "note_embedding_type": "clinicalbert",  # "clinicalbert" (768d) or "llama" (4096d)
@@ -1700,6 +1703,27 @@ def main():
     xgb_notes.save_model(os.path.join(exp_dir, 'model_xgb_notes.json'))
     logging.info(f"XGBoost + LLM Notes model saved to {exp_dir}/model_xgb_notes.json")
 
+    # LightGBM natively handles class imbalance via scale_pos_weight
+    lgb_base = lgb.LGBMClassifier(n_estimators=EXP_CONFIG['lgb_n_est'], max_depth=EXP_CONFIG['lgb_depth'],
+                                  scale_pos_weight=pos_weight_val,
+                                  n_jobs=-1, verbose=-1)
+    lgb_base.fit(X_xgb_base[train_idx], Y[train_idx])
+    lgb_base_probs = lgb_base.predict_proba(X_xgb_base[test_idx])[:, 1]
+    eval_lgb_base = _evaluate_xgb_probs(Y[test_idx], lgb_base_probs)
+    _log_eval_result('LightGBM Base', eval_lgb_base)
+    lgb_base.booster_.save_model(os.path.join(exp_dir, 'model_lgb_base.txt'))
+    logging.info(f"LightGBM Base model saved to {exp_dir}/model_lgb_base.txt")
+
+    lgb_notes = lgb.LGBMClassifier(n_estimators=EXP_CONFIG['lgb_n_est'], max_depth=EXP_CONFIG['lgb_depth'],
+                                   scale_pos_weight=pos_weight_val,
+                                   n_jobs=-1, verbose=-1)
+    lgb_notes.fit(X_xgb_notes[train_idx], Y[train_idx])
+    lgb_notes_probs = lgb_notes.predict_proba(X_xgb_notes[test_idx])[:, 1]
+    eval_lgb_notes = _evaluate_xgb_probs(Y[test_idx], lgb_notes_probs)
+    _log_eval_result('LightGBM + Notes', eval_lgb_notes)
+    lgb_notes.booster_.save_model(os.path.join(exp_dir, 'model_lgb_notes.txt'))
+    logging.info(f"LightGBM + LLM Notes model saved to {exp_dir}/model_lgb_notes.txt")
+
     # ── Collect all evaluation results ──────────────────────────────────────────
     all_eval_results = {
         'lstm_base': eval_base,
@@ -1710,6 +1734,8 @@ def main():
         'pretrained_crossmodal': eval_pretrain_cross,
         'xgb_base': eval_xgb_base,
         'xgb_notes': eval_xgb_notes,
+        'lgb_base': eval_lgb_base,
+        'lgb_notes': eval_lgb_notes,
     }
     # Remove non-serializable y_prob before saving
     eval_results_serializable = {}
@@ -1736,6 +1762,7 @@ def main():
     logging.info("---- @ Best F1 Threshold ----")
     for name, result in [
         ('XGBoost Base', eval_xgb_base), ('XGBoost + Notes', eval_xgb_notes),
+        ('LightGBM Base', eval_lgb_base), ('LightGBM + Notes', eval_lgb_notes),
         ('LSTM Base', eval_base), ('LSTM LateFusion', eval_notes),
         ('Transformer EarlyFusion', eval_tf), ('CrossModal Attention', eval_cross),
         ('Gated Fusion', eval_gated), ('Transformer Pretrain+CrossModal', eval_pretrain_cross),
@@ -1816,6 +1843,8 @@ def main():
 | top_k_codes | {EXP_CONFIG['top_k_codes']} |
 | xgb_n_estimators | {EXP_CONFIG['xgb_n_est']} |
 | xgb_max_depth    | {EXP_CONFIG['xgb_depth']} |
+| lgb_n_estimators | {EXP_CONFIG['lgb_n_est']} |
+| lgb_max_depth    | {EXP_CONFIG['lgb_depth']} |
 | early_stop_patience | {EXP_CONFIG['early_stop_patience']} |
 | early_stop_min_delta | 1e-4 |
 
@@ -1834,6 +1863,8 @@ def main():
 |-------|-----------|-------|-------|-----------|--------|-----|-------|
 {_note_row('XGBoost Base', eval_xgb_base)}
 {_note_row('XGBoost + LLM Notes', eval_xgb_notes)}
+{_note_row('LightGBM Base', eval_lgb_base)}
+{_note_row('LightGBM + LLM Notes', eval_lgb_notes)}
 {_note_row('LSTM Base', eval_base)}
 {_note_row('LSTM LateFusion (+ Notes)', eval_notes)}
 {_note_row('Transformer EarlyFusion (+ Notes)', eval_tf)}
@@ -1846,6 +1877,8 @@ def main():
 |-------|-----------|-------|-------|-----------|--------|-----|-------|
 {_note_row_05('XGBoost Base', eval_xgb_base)}
 {_note_row_05('XGBoost + LLM Notes', eval_xgb_notes)}
+{_note_row_05('LightGBM Base', eval_lgb_base)}
+{_note_row_05('LightGBM + LLM Notes', eval_lgb_notes)}
 {_note_row_05('LSTM Base', eval_base)}
 {_note_row_05('LSTM LateFusion (+ Notes)', eval_notes)}
 {_note_row_05('Transformer EarlyFusion (+ Notes)', eval_tf)}
@@ -1855,6 +1888,7 @@ def main():
 
 ### Note Embedding Impact (AUROC)
 - XGBoost: notes Δ AUC = {_m(eval_xgb_notes)['roc_auc'] - _m(eval_xgb_base)['roc_auc']:+.4f}
+- LightGBM: notes Δ AUC = {_m(eval_lgb_notes)['roc_auc'] - _m(eval_lgb_base)['roc_auc']:+.4f}
 - LSTM Late Fusion:       notes Δ AUC = {_m(eval_notes)['roc_auc'] - _m(eval_base)['roc_auc']:+.4f}
 - CrossModal Attn Fusion: vs LSTM Base Δ AUC = {_m(eval_cross)['roc_auc'] - _m(eval_base)['roc_auc']:+.4f}
 - **Gated Fusion: vs LSTM Base Δ AUC = {_m(eval_gated)['roc_auc'] - _m(eval_base)['roc_auc']:+.4f}**
@@ -1870,6 +1904,8 @@ def main():
 | `model_pretrained_cross_attn.pt` | Pretrained CrossModal Fusion state_dict |
 | `model_xgb_base.json`  | XGBoost Base (XGBoost native format) |
 | `model_xgb_notes.json` | XGBoost + Notes (XGBoost native format) |
+| `model_lgb_base.txt`   | LightGBM Base |
+| `model_lgb_notes.txt`  | LightGBM + Notes |
 | `seq_scaler.pkl`       | StandardScaler for sequence features (required for inference) |
 | `training.log`        | Full training log for this run |
 | `epoch_monitoring.json` | Per-epoch train_loss / val_loss / val_AUROC / val_PRAUC for all models |
