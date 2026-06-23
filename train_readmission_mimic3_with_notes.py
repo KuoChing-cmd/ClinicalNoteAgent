@@ -1204,6 +1204,58 @@ def enrich_stays_with_features(stays_df, con):
     return df
 
 
+def compute_icu_load_features(stays_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute ICU stay-duration features using the pre-existing LOS column
+    (Length of Stay in days) from ICUSTAYS.
+
+    Note on MIMIC-III time-shifting:
+      MIMIC-III shifts each patient's timestamps by an independent random offset,
+      so comparing absolute timestamps *across* patients is meaningless.  We
+      therefore do NOT compute any cross-patient concurrency metric (load_index).
+      Instead, we derive two within-patient / population-mean features that are
+      robust to the per-patient time shift:
+
+      - log_icu_los     : log1p(LOS in hours) — captures stay duration on a
+                          log scale, robust to outliers.
+      - icu_speedup_los : unit_mean_LOS - actual_LOS — deviation from the
+                          *same ICU unit*’s average LOS (grouped by FIRST_CAREUNIT).
+                          Positive = shorter than peers in the same unit type,
+                          suggesting potential capacity-driven early discharge.
+                          Using unit-level mean avoids confounding from the large
+                          baseline LOS differences across ICU types (e.g. MICU vs
+                          CSRU vs TSICU).
+    """
+    logging.info("Computing ICU LOS features (unit-grouped speedup via FIRST_CAREUNIT)...")
+    df = stays_df.copy()
+
+    # LOS in ICUSTAYS is in days; convert to hours
+    los_hours = df['LOS'].fillna(0.0).clip(lower=0.0) * 24.0
+    df['_los_h'] = los_hours
+
+    # Per-unit mean LOS (group by FIRST_CAREUNIT) — vectorised, no loop needed
+    unit_mean_los = df.groupby('FIRST_CAREUNIT')['_los_h'].transform('mean')
+
+    df['log_icu_los']     = np.log1p(los_hours).astype(np.float32)
+    df['icu_speedup_los'] = (unit_mean_los - los_hours).astype(np.float32)  # positive = shorter than unit peers
+    df.drop(columns=['_los_h'], inplace=True)
+
+    # Log per-unit stats for sanity check
+    unit_stats = stays_df.copy()
+    unit_stats['_los_h'] = los_hours
+    per_unit = unit_stats.groupby('FIRST_CAREUNIT')['_los_h'].agg(['mean', 'count'])
+    stats_str = ', '.join(
+        f"{u}: {row['mean']:.1f}h(n={int(row['count'])})"
+        for u, row in per_unit.iterrows()
+    )
+    logging.info(f"ICU LOS by unit — {stats_str}")
+    logging.info(
+        f"icu_speedup_los (unit-adjusted): range=[{df['icu_speedup_los'].min():.1f}, "
+        f"{df['icu_speedup_los'].max():.1f}]h, mean={df['icu_speedup_los'].mean():.2f}h"
+    )
+    return df
+
+
 def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     logging.info("Connecting to DuckDB and loading MIMIC-III features...")
     con = duckdb.connect()
@@ -1272,7 +1324,11 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     # Extract original features instead of fitting OLS
     stays_df = enrich_stays_with_features(stays_df, con)
     
-    cont_cols = ['age', 'pre_icu_transfers', 'surg_count', 'log_surg_gap', 'log_ed_wait']
+    # Add ICU LOS pressure features (uses ICUSTAYS.LOS column, no cross-patient timestamp comparison)
+    stays_df = compute_icu_load_features(stays_df)
+    
+    cont_cols = ['age', 'pre_icu_transfers', 'surg_count', 'log_surg_gap', 'log_ed_wait',
+                 'icu_speedup_los', 'log_icu_los']
     cat_cols = ['GENDER', 'MARITAL_STATUS', 'ETHNICITY', 'INSURANCE', 'ADMISSION_TYPE', 'ADMISSION_LOCATION', 'FIRST_CAREUNIT', 'surg_flag']
     
     static_encoders, static_dims = {}, {}
@@ -1401,6 +1457,7 @@ def make_exp_dir() -> str:
         f"{'_seqnorm' if EXP_CONFIG['opt_seq_norm'] else ''}"
         f"{'_cosinelr' if EXP_CONFIG['opt_cosine_lr'] else ''}"
         f"{'_posw' if EXP_CONFIG['opt_pos_weight'] else ''}"
+        f"_icuload"
         f"_{EXP_CONFIG['note_embedding_type']}"
     )
     exp_dir = os.path.join('output', f"{ts}_{tag}")
@@ -1448,8 +1505,8 @@ def main():
     # ── Dataset cache: skip 17-min DuckDB pipeline on repeat runs ─────────────
     # Cache is per embedding type to avoid conflicts
     cache_tag = f'_{emb_type}' if emb_type != 'llama' else ''
-    cache_npz = f'output/dataset_cache{cache_tag}_8dim.npz'
-    cache_meta = f'output/dataset_cache{cache_tag}_meta_8dim.pkl'
+    cache_npz  = f'output/dataset_cache{cache_tag}_8dim_icuload.npz'
+    cache_meta = f'output/dataset_cache{cache_tag}_meta_8dim_icuload.pkl'
     
     if os.path.exists(cache_npz) and os.path.exists(cache_meta):
         logging.info(f"Loading cached dataset from {cache_npz} ...")
@@ -1733,6 +1790,17 @@ def main():
 | Negatives (train) | {int(n_neg)} ({100*n_neg/len(Y_train):.1f}%) |
 | pos_weight applied | {pos_weight_val:.2f} |
 
+## Features
+| Group | Features | Dim |
+|-------|----------|-----|
+| Vital signs (seq) | HR, RR, SpO₂, SBP, DBP, MAP, Temp, Glucose | 48×8 |
+| Demographics (static) | age, gender, marital, ethnicity, insurance, adm_type, adm_loc, care_unit | 8 cols |
+| Surgical (static) | surg_count, surg_flag, log_surg_gap | 3 cols |
+| Admission (static) | pre_icu_transfers, log_ed_wait | 2 cols |
+| **ICU pressure (static)** | **icu_speedup_los, log_icu_los** | **2 cols (NEW)** |
+| Sparse codes (mh) | ICD-9 dx, DRG, ICD-9 proc, Rx (Top-64 each) | 256 |
+| Clinical notes | ClinicalBERT discharge note embedding | {EXP_CONFIG['note_dim']} |
+
 ## Model Hyperparameters
 | Param | Value |
 |-------|-------|
@@ -1759,6 +1827,7 @@ def main():
 | ③ | BCEWithLogitsLoss pos_weight / XGB scale_pos_weight | {'✅' if EXP_CONFIG['opt_pos_weight'] else '❌'} |
 | ④ | Early Stopping (val_loss, patience={EXP_CONFIG['early_stop_patience']}) | ✅ |
 | ⑤ | Best F1 threshold search | ✅ |
+| ⑥ | ICU pressure features (load_index, speedup_los, log_icu_los) | ✅ |
 
 ## Ablation Study Results — Test Set @ Best F1 Threshold
 | Model | Threshold | AUROC | PRAUC | Precision | Recall | F1 | Brier |
