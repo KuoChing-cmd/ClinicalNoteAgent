@@ -1803,7 +1803,7 @@ def main():
         m = _m(result)
         logging.info(
             f"  {name:30s}  t={m['threshold']:.3f}  AUROC={m['roc_auc']:.4f}  PRAUC={m['pr_auc']:.4f}  "
-            f"P={m['precision']:.4f}  R={m['recall']:.4f}  F1={m['f1']:.4f}  Brier={m['brier']:.4f}"
+            f"P={m['precision']:.4f}  R={m['recall']:.4f}  F1={m['f1']:.4f}  Acc={m['accuracy']:.4f}  Brier={m['brier']:.4f}"
         )
     logging.info("========================================================\n")
 
@@ -1820,14 +1820,14 @@ def main():
         m5 = _m(result, 'metrics_at_0.5')
         return (
             f"| {name} | {mb['threshold']:.3f} | {mb['roc_auc']:.4f} | {mb['pr_auc']:.4f} | "
-            f"{mb['precision']:.4f} | {mb['recall']:.4f} | {mb['f1']:.4f} | {mb['brier']:.4f} |"
+            f"{mb['precision']:.4f} | {mb['recall']:.4f} | {mb['f1']:.4f} | {mb['accuracy']:.4f} | {mb['brier']:.4f} |"
         )
     
     def _note_row_05(name, result):
         m5 = _m(result, 'metrics_at_0.5')
         return (
             f"| {name} | 0.500 | {m5['roc_auc']:.4f} | {m5['pr_auc']:.4f} | "
-            f"{m5['precision']:.4f} | {m5['recall']:.4f} | {m5['f1']:.4f} | {m5['brier']:.4f} |"
+            f"{m5['precision']:.4f} | {m5['recall']:.4f} | {m5['f1']:.4f} | {m5['accuracy']:.4f} | {m5['brier']:.4f} |"
         )
 
     note_path = os.path.join(exp_dir, 'experiment_note.md')
@@ -1892,8 +1892,8 @@ def main():
 | ⑥ | ICU pressure features (load_index, speedup_los, log_icu_los) | ✅ |
 
 ## Ablation Study Results — Test Set @ Best F1 Threshold
-| Model | Threshold | AUROC | PRAUC | Precision | Recall | F1 | Brier |
-|-------|-----------|-------|-------|-----------|--------|-----|-------|
+| Model | Threshold | AUROC | PRAUC | Precision | Recall | F1 | Acc | Brier |
+|-------|-----------|-------|-------|-----------|--------|----|-----|-------|
 {_note_row('XGBoost Base', eval_xgb_base)}
 {_note_row('XGBoost + LLM Notes', eval_xgb_notes)}
 {_note_row('LightGBM Base', eval_lgb_base)}
@@ -1906,8 +1906,8 @@ def main():
 {_note_row('**Pretrain+CrossModal**', eval_pretrain_cross)}
 
 ## Ablation Study Results — Test Set @ Fixed Threshold 0.5
-| Model | Threshold | AUROC | PRAUC | Precision | Recall | F1 | Brier |
-|-------|-----------|-------|-------|-----------|--------|-----|-------|
+| Model | Threshold | AUROC | PRAUC | Precision | Recall | F1 | Acc | Brier |
+|-------|-----------|-------|-------|-----------|--------|----|-----|-------|
 {_note_row_05('XGBoost Base', eval_xgb_base)}
 {_note_row_05('XGBoost + LLM Notes', eval_xgb_notes)}
 {_note_row_05('LightGBM Base', eval_lgb_base)}

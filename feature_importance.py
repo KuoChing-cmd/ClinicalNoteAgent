@@ -84,11 +84,13 @@ class TransformerEarlyFusionWithNotes(nn.Module):
         use_notes: bool = True,
         nhead: int = 4,
         num_layers: int = 2,
+        static_mode: str = "concat",
     ):
         super().__init__()
         self.use_notes = use_notes
         self.static_dims = static_dims or {}
         self.multihot_dims = multihot_dims or {}
+        self.static_mode = static_mode
 
         # 1. 时序编码器（Transformer）
         self.seq_proj = nn.Linear(seq_dim, hidden_dim)
@@ -105,23 +107,28 @@ class TransformerEarlyFusionWithNotes(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
 
         # 2. 静态特征
-        # vocab_size=0 表示连续特征（直接作为标量）；vocab_size>0 表示分类特征（Embedding）
-        # 与 old_train.py 完全对齐
         self.has_static = len(self.static_dims) > 0
         if self.has_static:
-            self.emb_dict = nn.ModuleDict()
-            static_repr_dim = 0
-            for name, vocab_size in self.static_dims.items():
-                if vocab_size <= 0:
-                    # 连续特征：直接作为 1-dim 标量传入
-                    static_repr_dim += 1
-                else:
-                    emb_dim = max(4, min(16, vocab_size // 2))
-                    self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
-                    static_repr_dim += emb_dim
-            self.static_head = nn.Sequential(
-                nn.Linear(static_repr_dim, hidden_dim), nn.ReLU()
-            )
+            if self.static_mode == "multi_token":
+                self.static_heads = nn.ModuleDict()
+                for name, vocab_size in self.static_dims.items():
+                    if vocab_size <= 0:
+                        self.static_heads[name] = nn.Sequential(nn.Linear(1, hidden_dim), nn.ReLU())
+                    else:
+                        self.static_heads[name] = nn.Embedding(vocab_size, hidden_dim)
+            else:
+                self.emb_dict = nn.ModuleDict()
+                static_repr_dim = 0
+                for name, vocab_size in self.static_dims.items():
+                    if vocab_size <= 0:
+                        static_repr_dim += 1
+                    else:
+                        emb_dim = max(4, min(16, vocab_size // 2))
+                        self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
+                        static_repr_dim += emb_dim
+                self.static_head = nn.Sequential(
+                    nn.Linear(static_repr_dim, hidden_dim), nn.ReLU()
+                )
 
         # 3. 多热稀疏特征（ICD / DRG / Proc / Rx）
         self.has_multihot = len(self.multihot_dims) > 0
@@ -173,18 +180,30 @@ class TransformerEarlyFusionWithNotes(nn.Module):
         extra_tokens: list[torch.Tensor] = []
 
         if self.has_static and x_static is not None:
-            static_embs: list[torch.Tensor] = []
-            col_idx = 0
-            for name, vocab_size in self.static_dims.items():
-                val = x_static[:, col_idx]
-                if vocab_size <= 0:
-                    # 连续特征：直接使用标量值
-                    static_embs.append(val.unsqueeze(1).float())
-                else:
-                    static_embs.append(self.emb_dict[name](val.long()))
-                col_idx += 1
-            static_repr = self.static_head(torch.cat(static_embs, dim=1))
-            extra_tokens.append(static_repr.unsqueeze(1))
+            if self.static_mode == "multi_token":
+                static_tokens = []
+                col_idx = 0
+                for name, vocab_size in self.static_dims.items():
+                    val = x_static[:, col_idx]
+                    if vocab_size <= 0:
+                        token = self.static_heads[name](val.unsqueeze(1).float())
+                    else:
+                        token = self.static_heads[name](val.long())
+                    static_tokens.append(token.unsqueeze(1))
+                    col_idx += 1
+                extra_tokens.extend(static_tokens)
+            else:
+                static_embs: list[torch.Tensor] = []
+                col_idx = 0
+                for name, vocab_size in self.static_dims.items():
+                    val = x_static[:, col_idx]
+                    if vocab_size <= 0:
+                        static_embs.append(val.unsqueeze(1).float())
+                    else:
+                        static_embs.append(self.emb_dict[name](val.long()))
+                    col_idx += 1
+                static_repr = self.static_head(torch.cat(static_embs, dim=1))
+                extra_tokens.append(static_repr.unsqueeze(1))
 
         if self.has_multihot and x_mh is not None:
             mh_embs: list[torch.Tensor] = []
@@ -728,6 +747,14 @@ def load_model(
             hidden_dim = 64
             logger.warning("Could not detect hidden_dim, defaulting to %d", hidden_dim)
 
+    # 自动探测 static_mode
+    static_mode = "concat"
+    if any(k.startswith("static_heads.") for k in state.keys()):
+        static_mode = "multi_token"
+        logger.info("Auto-detected static_mode='%s' from checkpoint", static_mode)
+    else:
+        logger.info("Auto-detected static_mode='concat' from checkpoint")
+
     model = TransformerEarlyFusionWithNotes(
         seq_dim=seq_dim,
         static_dims=static_dims,
@@ -737,6 +764,7 @@ def load_model(
         use_notes=True,
         nhead=nhead,
         num_layers=num_layers,
+        static_mode=static_mode,
     )
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
@@ -1024,9 +1052,19 @@ def main() -> None:
             sys.exit(1)
         logger.info("Auto-detected checkpoint: %s", ckpt)
 
-    # 自动检测 cache
-    cache = args.cache or _find_latest(REPO / "output", "dataset_cache_clinicalbert_*icuload*.npz")
-    meta = args.cache_meta or _find_latest(REPO / "output", "dataset_cache_clinicalbert_meta_*icuload*.pkl")
+    # 自动检测 cache (优先使用主训练脚本硬编码的默认路径)
+    default_cache = REPO / "output" / "dataset_cache_clinicalbert_8dim_icuload.npz"
+    default_meta = REPO / "output" / "dataset_cache_clinicalbert_meta_8dim_icuload.pkl"
+    
+    if args.cache:
+        cache = args.cache
+    else:
+        cache = default_cache if default_cache.exists() else _find_latest(REPO / "output", "dataset_cache_clinicalbert_*icuload*.npz")
+        
+    if args.cache_meta:
+        meta = args.cache_meta
+    else:
+        meta = default_meta if default_meta.exists() else _find_latest(REPO / "output", "dataset_cache_clinicalbert_meta_*icuload*.pkl")
 
     if cache is None or not cache.exists():
         logger.error("Cache .npz not found. Use --cache or --demo.")
