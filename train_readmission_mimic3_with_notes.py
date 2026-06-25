@@ -157,11 +157,12 @@ class PositionalEncoding(nn.Module):
         return x.transpose(0, 1)
 
 class TransformerEarlyFusionWithNotes(nn.Module):
-    def __init__(self, seq_dim, static_dims=None, multihot_dims=None, hidden_dim=64, note_dim=4096, use_notes=True, num_layers=4, nhead=8, dropout=0.2):
+    def __init__(self, seq_dim, static_dims=None, multihot_dims=None, hidden_dim=64, note_dim=4096, use_notes=True, num_layers=4, nhead=8, dropout=0.2, static_mode="concat"):
         super().__init__()
         self.use_notes = use_notes
         self.static_dims = static_dims or {}
         self.multihot_dims = multihot_dims or {}
+        self.static_mode = static_mode
         
         # 1. Sequence processing (Transformer)
         self.seq_proj = nn.Linear(seq_dim, hidden_dim)
@@ -175,15 +176,23 @@ class TransformerEarlyFusionWithNotes(nn.Module):
         # 2. Static processing (Demographics)
         self.has_static = len(self.static_dims) > 0
         if self.has_static:
-            self.emb_dict = nn.ModuleDict()
-            static_repr_dim = 0
-            for name, vocab_size in self.static_dims.items():
-                if self.static_dims[name] == 0: continue
-                emb_dim = max(4, min(16, vocab_size // 2))
-                self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
-                static_repr_dim += emb_dim
-            static_repr_dim += sum(1 for v in self.static_dims.values() if v == 0)
-            self.static_head = nn.Sequential(nn.Linear(static_repr_dim, hidden_dim), nn.ReLU())
+            if self.static_mode == "multi_token":
+                self.static_heads = nn.ModuleDict()
+                for name, vocab_size in self.static_dims.items():
+                    if vocab_size <= 0:
+                        self.static_heads[name] = nn.Sequential(nn.Linear(1, hidden_dim), nn.ReLU())
+                    else:
+                        self.static_heads[name] = nn.Embedding(vocab_size, hidden_dim)
+            else:
+                self.emb_dict = nn.ModuleDict()
+                static_repr_dim = 0
+                for name, vocab_size in self.static_dims.items():
+                    if self.static_dims[name] == 0: continue
+                    emb_dim = max(4, min(16, vocab_size // 2))
+                    self.emb_dict[name] = nn.Embedding(vocab_size, emb_dim)
+                    static_repr_dim += emb_dim
+                static_repr_dim += sum(1 for v in self.static_dims.values() if v == 0)
+                self.static_head = nn.Sequential(nn.Linear(static_repr_dim, hidden_dim), nn.ReLU())
             
         # 3. High-Dim Sparse Features (ICD, DRG, etc.)
         self.has_multihot = len(self.multihot_dims) > 0
@@ -227,17 +236,30 @@ class TransformerEarlyFusionWithNotes(nn.Module):
         extra_tokens = []
         
         if self.has_static and x_static is not None:
-            static_embs = []
-            col_idx = 0
-            for name, _ in self.static_dims.items():
-                val = x_static[:, col_idx]
-                if self.static_dims[name] == 0:
-                    static_embs.append(val.unsqueeze(1).float())
-                else:
-                    static_embs.append(self.emb_dict[name](val.long()))
-                col_idx += 1
-            static_repr = self.static_head(torch.cat(static_embs, dim=1))
-            extra_tokens.append(static_repr.unsqueeze(1))
+            if self.static_mode == "multi_token":
+                static_tokens = []
+                col_idx = 0
+                for name, vocab_size in self.static_dims.items():
+                    val = x_static[:, col_idx]
+                    if vocab_size <= 0:
+                        token = self.static_heads[name](val.unsqueeze(1).float())
+                    else:
+                        token = self.static_heads[name](val.long())
+                    static_tokens.append(token.unsqueeze(1))
+                    col_idx += 1
+                extra_tokens.extend(static_tokens)
+            else:
+                static_embs = []
+                col_idx = 0
+                for name, _ in self.static_dims.items():
+                    val = x_static[:, col_idx]
+                    if self.static_dims[name] == 0:
+                        static_embs.append(val.unsqueeze(1).float())
+                    else:
+                        static_embs.append(self.emb_dict[name](val.long()))
+                    col_idx += 1
+                static_repr = self.static_head(torch.cat(static_embs, dim=1))
+                extra_tokens.append(static_repr.unsqueeze(1))
             
         if self.has_multihot and x_mh is not None:
             mh_embs = []
@@ -1446,6 +1468,7 @@ EXP_CONFIG = {
     "opt_seq_norm":    True,     # ① StandardScaler on sequence features
     "opt_cosine_lr":   True,     # ② CosineAnnealingLR scheduler
     "opt_pos_weight":  True,     # ③ pos_weight for class imbalance
+    "static_mode":     "multi_token", # 开启细粒度多 Token 模式
 }
 
 def make_exp_dir() -> str:
