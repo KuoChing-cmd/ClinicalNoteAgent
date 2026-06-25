@@ -1703,11 +1703,21 @@ def main():
     xgb_notes.save_model(os.path.join(exp_dir, 'model_xgb_notes.json'))
     logging.info(f"XGBoost + LLM Notes model saved to {exp_dir}/model_xgb_notes.json")
 
+    # Find categorical indices for LightGBM
+    # X_xgb_base layout: [mean_seq (8), last_seq (8), static (cont + cat), mh]
+    num_seq_cols = X_seq.shape[2] * 2
+    cat_indices = []
+    current_idx = num_seq_cols
+    for col, dim in ordered_static_dims.items():
+        if dim > 0:  # dim > 0 indicates it's a categorical feature
+            cat_indices.append(current_idx)
+        current_idx += 1
+
     # LightGBM natively handles class imbalance via scale_pos_weight
     lgb_base = lgb.LGBMClassifier(n_estimators=EXP_CONFIG['lgb_n_est'], max_depth=EXP_CONFIG['lgb_depth'],
                                   scale_pos_weight=pos_weight_val,
                                   n_jobs=-1, verbose=-1)
-    lgb_base.fit(X_xgb_base[train_idx], Y[train_idx])
+    lgb_base.fit(X_xgb_base[train_idx], Y[train_idx], categorical_feature=cat_indices)
     lgb_base_probs = lgb_base.predict_proba(X_xgb_base[test_idx])[:, 1]
     eval_lgb_base = _evaluate_xgb_probs(Y[test_idx], lgb_base_probs)
     _log_eval_result('LightGBM Base', eval_lgb_base)
@@ -1717,7 +1727,7 @@ def main():
     lgb_notes = lgb.LGBMClassifier(n_estimators=EXP_CONFIG['lgb_n_est'], max_depth=EXP_CONFIG['lgb_depth'],
                                    scale_pos_weight=pos_weight_val,
                                    n_jobs=-1, verbose=-1)
-    lgb_notes.fit(X_xgb_notes[train_idx], Y[train_idx])
+    lgb_notes.fit(X_xgb_notes[train_idx], Y[train_idx], categorical_feature=cat_indices)
     lgb_notes_probs = lgb_notes.predict_proba(X_xgb_notes[test_idx])[:, 1]
     eval_lgb_notes = _evaluate_xgb_probs(Y[test_idx], lgb_notes_probs)
     _log_eval_result('LightGBM + Notes', eval_lgb_notes)
