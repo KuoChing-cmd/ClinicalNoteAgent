@@ -20,19 +20,19 @@ from tqdm import tqdm
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 CLINICALBERT_MODEL = "emilyalsentzer/Bio_ClinicalBERT"
-INPUT_FILE  = "output/mimic3_note_embeddings.pkl"
-OUTPUT_FILE = "output/mimic3_note_embeddings_clinicalbert.pkl"
+DEFAULT_INPUT_FILE  = "output/mimic3_note_embeddings.pkl"
+DEFAULT_OUTPUT_FILE = "output/mimic3_note_embeddings_clinicalbert.pkl"
 
 
-def main(batch_size=64):
+def main(input_file, output_file, batch_size=64):
     # ── 1. Load existing summaries ────────────────────────────────────────────
-    if not os.path.exists(INPUT_FILE):
-        logging.error(f"Source embeddings not found: {INPUT_FILE}")
+    if not os.path.exists(input_file):
+        logging.error(f"Source embeddings not found: {input_file}")
         logging.error("Run preprocess_note_embeddings.py first to generate Llama summaries.")
         return
 
-    logging.info(f"Loading summaries from {INPUT_FILE} ...")
-    with open(INPUT_FILE, 'rb') as f:
+    logging.info(f"Loading summaries from {input_file} ...")
+    with open(input_file, 'rb') as f:
         llama_dict = pickle.load(f)
 
     # Extract (stay_id, summary_text) pairs
@@ -114,16 +114,16 @@ def main(batch_size=64):
     logging.info(f"  - Truncated at 512 tokens: {n_truncated}")
 
     # ── 4. Save to new file ──────────────────────────────────────────────────
-    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-    with open(OUTPUT_FILE, 'wb') as f:
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, 'wb') as f:
         pickle.dump(results, f)
 
     # Verify
-    file_size_mb = os.path.getsize(OUTPUT_FILE) / (1024 * 1024)
-    logging.info(f"✅ Saved to {OUTPUT_FILE} ({file_size_mb:.1f} MB)")
+    file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
+    logging.info(f"✅ Saved to {output_file} ({file_size_mb:.1f} MB)")
 
     # Quick sanity check
-    with open(OUTPUT_FILE, 'rb') as f:
+    with open(output_file, 'rb') as f:
         check = pickle.load(f)
     sample_key = list(check.keys())[0]
     sample_val = check[sample_key]
@@ -132,7 +132,11 @@ def main(batch_size=64):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Re-embed clinical note summaries with ClinicalBERT")
+    parser.add_argument("--input", type=str, default=DEFAULT_INPUT_FILE,
+                        help="Path to input embeddings/summaries pickle file")
+    parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT_FILE,
+                        help="Path to save new ClinicalBERT embeddings pickle file")
     parser.add_argument("--batch-size", type=int, default=64,
                         help="Batch size for ClinicalBERT inference (default: 64)")
     args = parser.parse_args()
-    main(batch_size=args.batch_size)
+    main(input_file=args.input, output_file=args.output, batch_size=args.batch_size)

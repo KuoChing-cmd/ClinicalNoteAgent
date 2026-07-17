@@ -10,7 +10,6 @@ import concurrent.futures
 from tqdm import tqdm
 
 OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
-OLLAMA_EMBED_URL = "http://localhost:11434/api/embeddings"
 MODEL_NAME = "llama3.1:latest"
 MAX_NOTE_LEN = 12000
 
@@ -23,13 +22,18 @@ def clean_text(text):
 def summarize_notes(notes_text):
     notes_text = notes_text[:MAX_NOTE_LEN]
     prompt = f"""
-You are an expert clinical AI. Analyze the following ICU clinical notes and extract specific information that would be valuable for predicting the patient's likelihood of safe discharge vs readmission/mortality. 
-Summarize the key clinical trajectory and explicitly list 'discharge signals' or 'risk factors'.
+You are an expert clinical AI. Analyze the following ICU clinical notes to extract critical information that strongly predicts 30-day hospital readmission or mortality.
+Focus strictly on the following risk factors:
+1. Unresolved or active clinical issues at discharge.
+2. High-risk medications, changes in medication regimens, or polypharmacy.
+3. Vital sign instability or abnormal lab results near discharge.
+4. Psychosocial factors, patient non-compliance, or lack of social support.
+5. Severe chronic comorbidities or history of frequent admissions.
 
 NOTES:
 {notes_text}
 
-Provide ONLY the summary and risk factors, without intro/outro text.
+Provide a concise, structured summary explicitly highlighting any evidence of the above risk factors. Provide ONLY the summary and risk factors, without any intro/outro text.
 """
     payload = {"model": MODEL_NAME, "prompt": prompt, "stream": False, "options": {"temperature": 0.2}}
     try:
@@ -39,18 +43,6 @@ Provide ONLY the summary and risk factors, without intro/outro text.
     except Exception as e:
         print(f"Generate error: {e}")
     return ""
-
-def embed_text(text):
-    if not text: return np.zeros(4096, dtype=np.float32)
-    payload = {"model": MODEL_NAME, "prompt": text}
-    try:
-        resp = requests.post(OLLAMA_EMBED_URL, json=payload, timeout=120)
-        if resp.status_code == 200:
-            emb = resp.json().get("embedding", [])
-            return np.array(emb, dtype=np.float32)
-    except Exception as e:
-        print(f"Embed error: {e}")
-    return np.zeros(4096, dtype=np.float32)
 
 def main(limit=None):
     print("🚀 Using DuckDB to load MIMIC-III cohort...")
@@ -80,17 +72,17 @@ def main(limit=None):
     notes_df['CHARTTIME'] = pd.to_datetime(notes_df['CHARTTIME'], errors='coerce')
     notes_df['CHARTDATE'] = pd.to_datetime(notes_df['CHARTDATE'], errors='coerce')
     
-    output_file = 'output/mimic3_note_embeddings.pkl'
+    output_file = 'output/mimic3_note_summaries.pkl'
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     
-    embeddings_dict = {}
+    summaries_dict = {}
     if os.path.exists(output_file):
-        print(f"Loading existing embeddings from {output_file}...")
+        print(f"Loading existing summaries from {output_file}...")
         try:
             with open(output_file, 'rb') as f:
-                embeddings_dict = pickle.load(f)
+                summaries_dict = pickle.load(f)
         except Exception as e:
-            print(f"Failed to load existing embeddings: {e}")
+            print(f"Failed to load existing summaries: {e}")
 
     stay_tasks = []
     
@@ -109,12 +101,12 @@ def main(limit=None):
                 valid_notes.append(note['TEXT'])
                 
         is_processed = False
-        if stay_id in embeddings_dict:
-            val = embeddings_dict[stay_id]
+        if stay_id in summaries_dict:
+            val = summaries_dict[stay_id]
             if isinstance(val, dict):
-                is_processed = np.any(val.get('embedding', []))
+                is_processed = bool(val.get('summary', ''))
             else:
-                is_processed = np.any(val)
+                is_processed = bool(val)
 
         if not is_processed:
             stay_tasks.append({
@@ -126,31 +118,30 @@ def main(limit=None):
         stay_id = task['stay_id']
         valid_notes = task['valid_notes']
         if not valid_notes:
-            return stay_id, "", np.zeros(4096, dtype=np.float32)
+            return stay_id, ""
             
         combined_text = "\n\n---\n\n".join([clean_text(txt) for txt in valid_notes])
         summary = summarize_notes(combined_text)
-        emb = embed_text(summary)
-        return stay_id, summary, emb
+        return stay_id, summary
 
-    print("⚡ Generating Summaries and Embeddings via Ollama (Concurrent Batching)...")
+    print("⚡ Generating Summaries via Ollama (Concurrent Batching)...")
     # Using 8-16 workers is usually enough to fully saturate a 48GB GPU with Ollama's auto-batching.
     MAX_WORKERS = 8
     save_counter = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_task, task): task for task in stay_tasks}
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(stay_tasks)):
-            stay_id, summary, emb = future.result()
-            embeddings_dict[stay_id] = {'summary': summary, 'embedding': emb}
+            stay_id, summary = future.result()
+            summaries_dict[stay_id] = {'summary': summary}
             save_counter += 1
             if save_counter % 500 == 0:
                 with open(output_file, 'wb') as f:
-                    pickle.dump(embeddings_dict, f)
+                    pickle.dump(summaries_dict, f)
 
     with open(output_file, 'wb') as f:
-        pickle.dump(embeddings_dict, f)
+        pickle.dump(summaries_dict, f)
     
-    print(f"✅ Successfully saved {len(embeddings_dict)} embeddings to {output_file}")
+    print(f"✅ Successfully saved {len(summaries_dict)} summaries to {output_file}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess MIMIC-III note embeddings")
