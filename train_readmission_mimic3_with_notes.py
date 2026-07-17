@@ -1202,6 +1202,18 @@ def enrich_stays_with_features(stays_df, con):
         GROUP BY s.HADM_ID
     """).df()
     
+    hw_df = con.query("""
+        SELECT 
+            s.stay_id,
+            max(CASE WHEN c.ITEMID IN (920, 226730) THEN c.VALUENUM END) as height,
+            max(CASE WHEN c.ITEMID IN (762, 226512) THEN c.VALUENUM END) as weight
+        FROM stays_df_tmp s
+        JOIN read_csv_auto('/home/hanwen/data/mimic/iii/CHARTEVENTS.csv', sample_size=-1) c
+            ON s.stay_id = c.ICUSTAY_ID
+        WHERE c.ITEMID IN (920, 226730, 762, 226512) AND c.VALUENUM IS NOT NULL
+        GROUP BY s.stay_id
+    """).df()
+    
     df = stays_df.copy()
     
     df = df.merge(transfers_df, on='HADM_ID', how='left')
@@ -1221,6 +1233,10 @@ def enrich_stays_with_features(stays_df, con):
     df['EDOUTTIME'] = pd.to_datetime(df['EDOUTTIME'])
     ed_wait = (df['EDOUTTIME'] - df['EDREGTIME']).dt.total_seconds() / 3600.0
     df['log_ed_wait'] = np.log1p(np.where((ed_wait > 0) & (ed_wait < 240), ed_wait, 0))
+    
+    df = df.merge(hw_df, on='stay_id', how='left')
+    df['height'] = df['height'].fillna(0)
+    df['weight'] = df['weight'].fillna(0)
     
     con.unregister('stays_df_tmp')
     
@@ -1279,8 +1295,8 @@ def compute_icu_load_features(stays_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
-    logging.info("Connecting to DuckDB and loading MIMIC-III features...")
+def fetch_mimic3_data(embeddings_dict, note_emb_dim=768, task='readmission'):
+    logging.info(f"Connecting to DuckDB and loading MIMIC-III features for task: {task}...")
     con = duckdb.connect()
     
     stay_ids = list(embeddings_dict.keys())
@@ -1291,8 +1307,8 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     stays_df = con.query(f"""
         SELECT 
             s.SUBJECT_ID, s.HADM_ID, s.ICUSTAY_ID as stay_id, s.INTIME, s.OUTTIME, s.FIRST_CAREUNIT, s.LOS,
-            a.ETHNICITY, a.MARITAL_STATUS, a.INSURANCE, a.ADMISSION_TYPE, a.ADMISSION_LOCATION,
-            a.EDREGTIME, a.EDOUTTIME,
+            a.ETHNICITY, a.MARITAL_STATUS, a.RELIGION, a.INSURANCE, a.ADMISSION_TYPE, a.ADMISSION_LOCATION,
+            a.EDREGTIME, a.EDOUTTIME, a.HOSPITAL_EXPIRE_FLAG,
             p.GENDER, p.DOB
         FROM read_csv_auto('/home/hanwen/data/mimic/iii/ICUSTAYS.csv', sample_size=-1) s
         JOIN read_csv_auto('/home/hanwen/data/mimic/iii/ADMISSIONS.csv', sample_size=-1) a ON s.HADM_ID = a.HADM_ID
@@ -1300,7 +1316,6 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
         WHERE s.ICUSTAY_ID IN {tuple(stay_ids)}
     """).df()
     
-    # Parse timestamps first, then compute ICU readmission labels.
     # Two conditions (OR logic) define a positive label:
     #   A. 跨次住院（Cross-admission）：同一 SUBJECT_ID 在本次出院后 30 天内
     #      有另一次 ICU 入院（不同 HADM_ID）。
@@ -1310,35 +1325,44 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     stays_df['OUTTIME'] = pd.to_datetime(stays_df['OUTTIME'])
     stays_df = stays_df.sort_values(['SUBJECT_ID', 'INTIME']).reset_index(drop=True)
 
-    logging.info("Computing ICU readmission labels (30-day cross-admission OR within-admission)...")
-    readmitted_flags = []
-    source_a_count = 0
-    source_b_count = 0
-    for i, row in stays_df.iterrows():
-        # Condition A: 30天内跨次住院 ICU 再入院
-        cond_a = stays_df[
-            (stays_df['SUBJECT_ID'] == row['SUBJECT_ID']) &
-            (stays_df['HADM_ID']    != row['HADM_ID']) &
-            (stays_df['INTIME']      > row['OUTTIME']) &
-            (stays_df['INTIME']     <= row['OUTTIME'] + pd.Timedelta(days=30))
-        ]
-        # Condition B: 同一次住院（相同 HADM_ID）内的 ICU 再入院
-        cond_b = stays_df[
-            (stays_df['HADM_ID'] == row['HADM_ID']) &
-            (stays_df['INTIME']   > row['OUTTIME'])
-        ]
-        flag = 1 if (len(cond_a) > 0 or len(cond_b) > 0) else 0
-        readmitted_flags.append(flag)
-        if flag:
-            if len(cond_a) > 0: source_a_count += 1
-            if len(cond_b) > 0: source_b_count += 1
-    stays_df['readmitted'] = readmitted_flags
-    pos_rate = stays_df['readmitted'].mean()
-    logging.info(
-        f"ICU readmission rate: {pos_rate:.1%} "
-        f"({stays_df['readmitted'].sum()} / {len(stays_df)} stays) | "
-        f"Cross-admission(A): {source_a_count}, Within-admission(B): {source_b_count}"
-    )
+    if task == 'readmission':
+        logging.info("Computing ICU readmission labels (30-day cross-admission OR within-admission)...")
+        readmitted_flags = []
+        source_a_count = 0
+        source_b_count = 0
+        for i, row in stays_df.iterrows():
+            # Condition A: 30天内跨次住院 ICU 再入院
+            cond_a = stays_df[
+                (stays_df['SUBJECT_ID'] == row['SUBJECT_ID']) &
+                (stays_df['HADM_ID']    != row['HADM_ID']) &
+                (stays_df['INTIME']      > row['OUTTIME']) &
+                (stays_df['INTIME']     <= row['OUTTIME'] + pd.Timedelta(days=30))
+            ]
+            # Condition B: 同一次住院（相同 HADM_ID）内的 ICU 再入院
+            cond_b = stays_df[
+                (stays_df['HADM_ID'] == row['HADM_ID']) &
+                (stays_df['INTIME']   > row['OUTTIME'])
+            ]
+            flag = 1 if (len(cond_a) > 0 or len(cond_b) > 0) else 0
+            readmitted_flags.append(flag)
+            if flag:
+                if len(cond_a) > 0: source_a_count += 1
+                if len(cond_b) > 0: source_b_count += 1
+        stays_df['label'] = readmitted_flags
+        logging.info(
+            f"ICU readmission rate: {stays_df['label'].mean():.1%} "
+            f"({stays_df['label'].sum()} / {len(stays_df)} stays) | "
+            f"Cross-admission(A): {source_a_count}, Within-admission(B): {source_b_count}"
+        )
+    elif task == 'mortality':
+        logging.info("Computing In-Hospital Mortality labels...")
+        stays_df['label'] = stays_df['HOSPITAL_EXPIRE_FLAG'].fillna(0).astype(int).tolist()
+        logging.info(
+            f"In-Hospital Mortality rate: {stays_df['label'].mean():.1%} "
+            f"({stays_df['label'].sum()} / {len(stays_df)} stays)"
+        )
+    else:
+        raise ValueError(f"Unknown task: {task}")
 
     stays_df['DOB'] = pd.to_datetime(stays_df['DOB'], errors='coerce')
     stays_df['age'] = (stays_df['INTIME'] - stays_df['DOB']).dt.days / 365.25
@@ -1351,8 +1375,8 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     stays_df = compute_icu_load_features(stays_df)
     
     cont_cols = ['age', 'pre_icu_transfers', 'surg_count', 'log_surg_gap', 'log_ed_wait',
-                 'icu_speedup_los', 'log_icu_los']
-    cat_cols = ['GENDER', 'MARITAL_STATUS', 'ETHNICITY', 'INSURANCE', 'ADMISSION_TYPE', 'ADMISSION_LOCATION', 'FIRST_CAREUNIT', 'surg_flag']
+                 'icu_speedup_los', 'log_icu_los', 'height', 'weight']
+    cat_cols = ['GENDER', 'MARITAL_STATUS', 'RELIGION', 'ETHNICITY', 'INSURANCE', 'ADMISSION_TYPE', 'ADMISSION_LOCATION', 'FIRST_CAREUNIT', 'surg_flag']
     
     static_encoders, static_dims = {}, {}
     for col in cont_cols:
@@ -1387,7 +1411,14 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
         8368: 4, 220051: 4,               # Diastolic BP
         52: 5, 220052: 5, 225312: 5,      # MAP
         678: 6, 223761: 6, 676: 6, 223762: 6, # Temperature
-        807: 7, 811: 7, 1529: 7, 225664: 7, 220621: 7 # Glucose
+        807: 7, 811: 7, 1529: 7, 225664: 7, 220621: 7, # Glucose
+        184: 8, 220739: 8,                # GCS Eye Opening
+        454: 9, 223901: 9,                # GCS Motor Response
+        723: 10, 223900: 10,              # GCS Verbal Response
+        198: 11,                          # GCS Total
+        780: 12, 1126: 12, 220274: 12,    # pH
+        3420: 13, 190: 13, 223835: 13,    # FiO2
+        3348: 14, 115: 14, 224308: 14, 8377: 14 # Capillary Refill Rate
     }
     logging.info(f"Querying CHARTEVENTS for sequences...")
     events_df = con.query(f"""
@@ -1398,6 +1429,7 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     
     logging.info("Formatting dataset...")
     X_seq, X_static, X_mh, X_note, Y = [], [], [], [], []
+    dropped_count = 0
     
     for _, stay in stays_df.iterrows():
         sid = stay['stay_id']
@@ -1405,15 +1437,24 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
         
         # Sequence
         evs = events_df[events_df['stay_id'] == sid].copy()
+        if evs.empty:
+            dropped_count += 1
+            continue
+            
+        evs['CHARTTIME'] = pd.to_datetime(evs['CHARTTIME'])
+        evs['hour'] = ((evs['CHARTTIME'] - stay['INTIME']).dt.total_seconds() / 3600).astype(int)
+        evs = evs[(evs['hour'] >= 0) & (evs['hour'] < 48)]
+        
+        observed_channels = evs['ITEMID'].map(item_map).nunique()
+        if observed_channels < 8:
+            dropped_count += 1
+            continue
+
         # Bug3 fix: initialize with NaN so that un-observed slots are truly missing,
         # and real zero-valued measurements are NOT incorrectly treated as absent.
-        seq = np.full((48, 8), np.nan, dtype=np.float32)
-        if not evs.empty:
-            evs['CHARTTIME'] = pd.to_datetime(evs['CHARTTIME'])
-            evs['hour'] = ((evs['CHARTTIME'] - stay['INTIME']).dt.total_seconds() / 3600).astype(int)
-            evs = evs[(evs['hour'] >= 0) & (evs['hour'] < 48)]
-            for _, e in evs.iterrows():
-                seq[int(e['hour']), item_map[e['ITEMID']]] = e['VALUENUM']
+        seq = np.full((48, 15), np.nan, dtype=np.float32)
+        for _, e in evs.iterrows():
+            seq[int(e['hour']), item_map[e['ITEMID']]] = e['VALUENUM']
 
         # ffill: carry last observed value forward; fill remaining leading NaNs with 0
         df_seq = pd.DataFrame(seq).ffill().fillna(0.0)
@@ -1437,8 +1478,9 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
             val = val.get('embedding', np.zeros(note_emb_dim, dtype=np.float32))
         X_note.append(np.array(val, dtype=np.float32))
         
-        Y.append(stay['readmitted'])
+        Y.append(stay['label'])
         
+    logging.info(f"Dropped {dropped_count} stays due to extreme missingness (< 3 observed signals)")
     return np.array(X_seq), np.array(X_static, dtype=np.float32), np.array(X_mh, dtype=np.float32), np.array(X_note), np.array(Y), static_dims, multihot_dims
 
 def flatten_features(X_seq, X_static, X_mh):
@@ -1456,6 +1498,7 @@ EXP_CONFIG = {
     "tf_nhead":    4,            # ↓ from 8; reduce Transformer heads
     "dropout":     0.3,          # ↑ from 0.2; add more regularization globally
     "note_dim":    None,         # auto-detected from embeddings (768 for ClinicalBERT, 4096 for Llama)
+    "task":        "readmission",# "readmission" or "mortality"
     "top_k_codes": 64,           # top-K for ICD/DRG/Proc/Rx multi-hot
     "xgb_n_est":   200,
     "xgb_depth":   6,
@@ -1486,11 +1529,12 @@ def make_exp_dir() -> str:
         f"_icuload"
         f"_{EXP_CONFIG['note_embedding_type']}"
     )
-    exp_dir = os.path.join('output', f"{ts}_{tag}")
+    exp_dir = os.path.join('output', f"{ts}_{EXP_CONFIG.get('task', 'readmission')}_{tag}")
     os.makedirs(exp_dir, exist_ok=True)
     return exp_dir
 
-def main():
+def run_experiment_for_task(task_name):
+    EXP_CONFIG['task'] = task_name
     # ── Determine embedding file ──────────────────────────────────────────────
     emb_type = EXP_CONFIG['note_embedding_type']
     if emb_type == 'clinicalbert':
@@ -1530,9 +1574,10 @@ def main():
     
     # ── Dataset cache: skip 17-min DuckDB pipeline on repeat runs ─────────────
     # Cache is per embedding type to avoid conflicts
+    task = EXP_CONFIG.get('task', 'readmission')
     cache_tag = f'_{emb_type}' if emb_type != 'llama' else ''
-    cache_npz  = f'output/dataset_cache{cache_tag}_8dim_icuload.npz'
-    cache_meta = f'output/dataset_cache{cache_tag}_meta_8dim_icuload.pkl'
+    cache_npz  = f'output/dataset_cache_{task}{cache_tag}_15dim_filtered_icuload.npz'
+    cache_meta = f'output/dataset_cache_{task}{cache_tag}_meta_15dim_filtered_icuload.pkl'
     
     if os.path.exists(cache_npz) and os.path.exists(cache_meta):
         logging.info(f"Loading cached dataset from {cache_npz} ...")
@@ -1556,7 +1601,7 @@ def main():
     else:
         logging.info("No dataset cache found — running full DuckDB pipeline...")
         X_seq, X_static, X_mh, X_note, Y, static_dims, multihot_dims = fetch_mimic3_data(
-            embeddings_dict, note_emb_dim=note_dim_detected
+            embeddings_dict, note_emb_dim=note_dim_detected, task=task
         )
         if X_seq is None: return
         # Save cache for future runs
@@ -1605,7 +1650,7 @@ def main():
     logging.info("\n================ ABLATION STUDY: CLINICAL ALIGNMENT ================")
     
     logging.info("1. Training Base LSTM (Clinical Series + Demographics + ICD/DRG/Proc/Rx, NO Notes)...")
-    model_base = LSTMLateFusionWithNotes(seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims, use_notes=False, num_layers=EXP_CONFIG['num_layers'], dropout=EXP_CONFIG['dropout'])
+    model_base = LSTMLateFusionWithNotes(seq_dim=15, static_dims=ordered_static_dims, multihot_dims=multihot_dims, use_notes=False, num_layers=EXP_CONFIG['num_layers'], dropout=EXP_CONFIG['dropout'])
     model_base, hist_base = train_model(
         model_base, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx],
@@ -1618,7 +1663,7 @@ def main():
     logging.info(f"Base LSTM model saved to {exp_dir}/model_lstm_base.pt")
     
     logging.info("2. Training Late Fusion LSTM (Base + LLM Notes Embedding)...")
-    model_notes = LSTMLateFusionWithNotes(seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True, num_layers=EXP_CONFIG['num_layers'], dropout=EXP_CONFIG['dropout'])
+    model_notes = LSTMLateFusionWithNotes(seq_dim=15, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True, num_layers=EXP_CONFIG['num_layers'], dropout=EXP_CONFIG['dropout'])
     model_notes, hist_notes = train_model(
         model_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
@@ -1631,7 +1676,7 @@ def main():
     logging.info(f"Late Fusion LSTM model saved to {exp_dir}/model_lstm_notes.pt")
     
     logging.info("3. Training Early Fusion Transformer (Base + LLM Notes Embedding)...")
-    model_tf_notes = TransformerEarlyFusionWithNotes(seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True, num_layers=EXP_CONFIG['tf_num_layers'], nhead=EXP_CONFIG['tf_nhead'], dropout=EXP_CONFIG['dropout'])
+    model_tf_notes = TransformerEarlyFusionWithNotes(seq_dim=15, static_dims=ordered_static_dims, multihot_dims=multihot_dims, note_dim=EXP_CONFIG['note_dim'], use_notes=True, num_layers=EXP_CONFIG['tf_num_layers'], nhead=EXP_CONFIG['tf_nhead'], dropout=EXP_CONFIG['dropout'])
     model_tf_notes, hist_tf = train_model(
         model_tf_notes, X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx], X_note[train_idx],
         X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx], X_note_val=X_note[val_idx],
@@ -1645,7 +1690,7 @@ def main():
     
     logging.info("4. Training Cross-Modal Attention Fusion (LSTM × Note Cross-Attention)...")
     model_cross = CrossModalAttnFusion(
-        seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims,
+        seq_dim=15, static_dims=ordered_static_dims, multihot_dims=multihot_dims,
         hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'],
         nhead=EXP_CONFIG["tf_nhead"], num_virtual_tokens=2, num_lstm_layers=EXP_CONFIG["num_layers"], dropout=EXP_CONFIG["dropout"]
     )
@@ -1662,7 +1707,7 @@ def main():
     
     logging.info("5. Training Gated Fusion (LSTM × Note Gated Blend)...")
     model_gated = GatedFusionWithNotes(
-        seq_dim=8, static_dims=ordered_static_dims, multihot_dims=multihot_dims,
+        seq_dim=15, static_dims=ordered_static_dims, multihot_dims=multihot_dims,
         hidden_dim=EXP_CONFIG['hidden_dim'], note_dim=EXP_CONFIG['note_dim'], num_lstm_layers=EXP_CONFIG["num_layers"], dropout=EXP_CONFIG["dropout"]
     )
     model_gated, hist_gated = train_model(
@@ -1678,9 +1723,9 @@ def main():
     
     logging.info("6. Training Pretrained Transformer + Cross-Modal Attention...")
     # 1. Pretrain the encoder
-    pretrained_encoder = TransformerSeqEncoder(seq_input_dim=8, hidden_dim=EXP_CONFIG['hidden_dim'], num_layers=EXP_CONFIG['tf_num_layers'], nhead=EXP_CONFIG['tf_nhead'], dropout=EXP_CONFIG['dropout'])
+    pretrained_encoder = TransformerSeqEncoder(seq_input_dim=15, hidden_dim=EXP_CONFIG['hidden_dim'], num_layers=EXP_CONFIG['tf_num_layers'], nhead=EXP_CONFIG['tf_nhead'], dropout=EXP_CONFIG['dropout'])
     pretrained_encoder = pretrain_transformer(
-        pretrained_encoder, X_seq[train_idx], seq_dim=8, hidden_dim=EXP_CONFIG['hidden_dim'],
+        pretrained_encoder, X_seq[train_idx], seq_dim=15, hidden_dim=EXP_CONFIG['hidden_dim'],
         epochs=10, lr=1e-3, batch_size=EXP_CONFIG['batch_size'], mask_prob=0.15
     )
     
@@ -1948,5 +1993,12 @@ def main():
     logging.info(f"Experiment note written to {note_path}")
     logging.getLogger().removeHandler(exp_log_handler)
 
-if __name__ == "__main__":
+def main():
+    for t in ['readmission', 'mortality']:
+        logging.info("=" * 60)
+        logging.info(f"STARTING FULL PIPELINE FOR TASK: {t.upper()}")
+        logging.info("=" * 60)
+        run_experiment_for_task(t)
+
+if __name__ == '__main__':
     main()
