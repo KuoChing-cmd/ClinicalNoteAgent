@@ -1,13 +1,14 @@
 """Data export utilities for MIMIC4 game theory research."""
 
-from typing import Dict, List, Any, Optional
-import json
 import csv
-from pathlib import Path
-from datetime import datetime
-from sqlalchemy.orm import Session
-from sqlalchemy import func, case
+import json
 import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import case, func
+from sqlalchemy.orm import Session
 
 from .mimic4_query import MIMIC4DataExtractor
 from .patient_filter import PatientFilter
@@ -124,19 +125,21 @@ class DataExporter:
                 # 进度提示
                 if idx % 50 == 0 or idx == 1 or idx == total:
                     print(f"  进度: {idx}/{total} ({idx*100//total}%)")
-                
+
                 patient_data = self.extractor.get_complete_patient_data(hadm_id)
-                dataset.append({
-                    "hadm_id": hadm_id,
-                    "data": patient_data,
-                })
+                dataset.append(
+                    {
+                        "hadm_id": hadm_id,
+                        "data": patient_data,
+                    }
+                )
             except Exception as e:
                 logger.warning(f"Failed to export patient {hadm_id}: {e}")
                 failed += 1
 
         if failed > 0:
             print(f"⚠️ {failed} 个患者导出失败")
-        
+
         print(f"✅ 成功导出 {len(dataset)} 个患者")
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -188,12 +191,14 @@ class DataExporter:
 
             for subject_id, hadm_id, score in patients:
                 patient_data = self.extractor.get_complete_patient_data(hadm_id)
-                full_data.append({
-                    "subject_id": subject_id,
-                    "hadm_id": hadm_id,
-                    "complexity_score": score,
-                    "data": patient_data,
-                })
+                full_data.append(
+                    {
+                        "subject_id": subject_id,
+                        "hadm_id": hadm_id,
+                        "complexity_score": score,
+                        "data": patient_data,
+                    }
+                )
 
             # Export to JSON
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -225,12 +230,10 @@ class DataExporter:
             .all()
         )
 
-        summary["gender_distribution"] = {
-            g: count for g, count in gender_dist
-        }
+        summary["gender_distribution"] = {g: count for g, count in gender_dist}
 
         # Age distribution
-        from sqlalchemy import func, case
+        from sqlalchemy import case, func
 
         age_dist = (
             self.session.query(
@@ -247,18 +250,14 @@ class DataExporter:
             .all()
         )
 
-        summary["age_distribution"] = {
-            group: count for group, count in age_dist
-        }
+        summary["age_distribution"] = {group: count for group, count in age_dist}
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"summary_statistics_{timestamp}.json"
 
         return self.export_to_json(summary, filename)
 
-    def export_for_pandas(
-        self, hadm_ids: Optional[List[int]] = None
-    ) -> Dict[str, Any]:
+    def export_for_pandas(self, hadm_ids: Optional[List[int]] = None) -> Dict[str, Any]:
         """导出数据为适合pandas的格式.
 
         Args:
@@ -293,7 +292,9 @@ class DataExporter:
             all_transfers.extend(self.extractor.get_transfers(hadm_id))
             all_diagnoses.extend(self.extractor.get_diagnoses(hadm_id))
             all_procedures.extend(self.extractor.get_procedures(hadm_id))
-            all_prescriptions.extend(self.extractor.get_prescriptions(hadm_id, limit=50))
+            all_prescriptions.extend(
+                self.extractor.get_prescriptions(hadm_id, limit=50)
+            )
 
         return {
             "basic_info": pd.DataFrame(all_basic_info),

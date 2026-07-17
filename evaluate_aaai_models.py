@@ -200,8 +200,8 @@ def compute_metrics(y_true, y_score, threshold=0.5):
     
     auroc = roc_auc_score(y_true, y_score)
     precisions, recalls, _ = precision_recall_curve(y_true, y_score)
-    # Compatibility with older numpy via trapz instead of trapezoid
-    auprc = float(np.trapz(precisions, recalls))
+    # Use sklearn auc to avoid numpy version issues (np.trapz removed in np 2.0)
+    auprc = float(auc(recalls, precisions))
     
     return [acc, prec0, prec1, rec0, rec1, macro_f1, auroc, auprc]
 

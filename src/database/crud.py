@@ -1,7 +1,8 @@
 """CRUD operations for database models."""
 
-from typing import TypeVar, Generic, List, Optional, Type, Dict, Any
 import logging
+from typing import Any, Dict, Generic, List, Optional, Type, TypeVar
+
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -52,9 +53,7 @@ class CRUDOperations(Generic[T]):
             Model instance or None if not found
         """
         try:
-            obj = self.session.query(self.model).filter(
-                self.model.id == obj_id
-            ).first()
+            obj = self.session.query(self.model).filter(self.model.id == obj_id).first()
             if obj:
                 logger.info(f"Read record: {obj}")
             return obj
@@ -91,9 +90,7 @@ class CRUDOperations(Generic[T]):
             Updated model instance or None if not found
         """
         try:
-            obj = self.session.query(self.model).filter(
-                self.model.id == obj_id
-            ).first()
+            obj = self.session.query(self.model).filter(self.model.id == obj_id).first()
             if obj:
                 for key, value in obj_data.items():
                     setattr(obj, key, value)
@@ -116,9 +113,7 @@ class CRUDOperations(Generic[T]):
             True if deleted, False if not found
         """
         try:
-            obj = self.session.query(self.model).filter(
-                self.model.id == obj_id
-            ).first()
+            obj = self.session.query(self.model).filter(self.model.id == obj_id).first()
             if obj:
                 self.session.delete(obj)
                 self.session.commit()

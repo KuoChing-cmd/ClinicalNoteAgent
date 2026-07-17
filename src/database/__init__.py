@@ -56,9 +56,15 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "Prescription": ("src.database.mimic4_models", "Prescription"),
     "EligiblePatient": ("src.database.mimic4_models", "EligiblePatient"),
     "MIMIC4DataExtractor": ("src.database.mimic4_query", "MIMIC4DataExtractor"),
-    "extract_and_export_sample_data": ("src.database.mimic4_query", "extract_and_export_sample_data"),
+    "extract_and_export_sample_data": (
+        "src.database.mimic4_query",
+        "extract_and_export_sample_data",
+    ),
     "PatientFilter": ("src.database.patient_filter", "PatientFilter"),
-    "select_patients_for_game_scenarios": ("src.database.patient_filter", "select_patients_for_game_scenarios"),
+    "select_patients_for_game_scenarios": (
+        "src.database.patient_filter",
+        "select_patients_for_game_scenarios",
+    ),
     "DataExporter": ("src.database.data_export", "DataExporter"),
     "quick_export_sample": ("src.database.data_export", "quick_export_sample"),
     "EligiblePatientsPharmacyAnalyzer": (
@@ -82,4 +88,3 @@ def __getattr__(name: str) -> Any:
     value = getattr(module, attr_name)
     globals()[name] = value
     return value
-

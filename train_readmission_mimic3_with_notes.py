@@ -19,7 +19,7 @@ import duckdb
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, auc, precision_recall_curve
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from tqdm import tqdm
 import xgboost as xgb
@@ -795,14 +795,8 @@ def _compute_prauc(y_true, y_score):
     if y_true.sum() == 0:
         return float('nan')
     order = np.argsort(y_score)[::-1]
-    y_sorted = y_true[order]
-    tp_cumsum = np.cumsum(y_sorted)
-    n_pos = int(y_true.sum())
-    recalls = tp_cumsum / n_pos
-    precisions = tp_cumsum / np.arange(1, len(y_sorted) + 1)
-    recalls = np.concatenate([[0.0], recalls])
-    precisions = np.concatenate([[1.0], precisions])
-    return float(np.trapz(precisions, recalls))
+    precisions, recalls, _ = precision_recall_curve(y_true, y_score)
+    return float(auc(recalls, precisions))
 
 
 def train_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None,

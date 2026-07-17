@@ -1,27 +1,27 @@
 """MIMIC4 data extraction queries for asymmetric information game theory research."""
 
-from typing import Dict, List, Any, Optional, Sequence
-from datetime import date, datetime, time, timedelta
+import logging
 import re
 import time as pytime
-from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, func, text, bindparam
+from datetime import date, datetime, time, timedelta
+from typing import Any, Dict, List, Optional, Sequence
+
+from sqlalchemy import and_, bindparam, func, or_, text
 from sqlalchemy.exc import OperationalError
-import logging
+from sqlalchemy.orm import Session
 
 from .mimic4_models import (
-    Patient,
     Admission,
-    ICUStay,
-    Transfer,
     DiagnosisICD,
     DICDDiagnosis,
-    ProcedureICD,
     DICDProcedure,
-    Prescription,
     EligiblePatient,
+    ICUStay,
+    Patient,
+    Prescription,
+    ProcedureICD,
+    Transfer,
 )
-
 
 DEFAULT_CHARTEVENT_LABEL_WHITELIST_TOP100: tuple[str, ...] = (
     "Heart Rate",
@@ -165,7 +165,9 @@ class MIMIC4DataExtractor:
         if "/" not in s:
             return None, None
         left, right = s.split("/", 1)
-        return MIMIC4DataExtractor._try_parse_float(left), MIMIC4DataExtractor._try_parse_float(right)
+        return MIMIC4DataExtractor._try_parse_float(
+            left
+        ), MIMIC4DataExtractor._try_parse_float(right)
 
     @staticmethod
     def _coerce_charttime(value: Any) -> datetime | None:
@@ -215,12 +217,20 @@ class MIMIC4DataExtractor:
         attempt = 0
         while True:
             try:
-                stmt = statement.execution_options(stream_results=True) if stream_results else statement
-                return [dict(r) for r in self.session.execute(stmt, params).mappings().all()]
+                stmt = (
+                    statement.execution_options(stream_results=True)
+                    if stream_results
+                    else statement
+                )
+                return [
+                    dict(r) for r in self.session.execute(stmt, params).mappings().all()
+                ]
             except OperationalError as exc:
                 attempt += 1
                 self._reset_session_after_disconnect()
-                if attempt >= int(max_retries) or not self._is_retryable_mysql_disconnect(exc):
+                if attempt >= int(
+                    max_retries
+                ) or not self._is_retryable_mysql_disconnect(exc):
                     raise
                 wait_s = min(10.0, 0.8 * float(attempt))
                 logger.warning(
@@ -254,8 +264,7 @@ class MIMIC4DataExtractor:
             current_limit = min(safe_batch_size, remaining)
 
             if lab_itemids:
-                chunk_sql = text(
-                    """
+                chunk_sql = text("""
                     SELECT
                         :stay_id AS stay_id,
                         le.charttime,
@@ -278,8 +287,7 @@ class MIMIC4DataExtractor:
                       )
                     ORDER BY le.charttime ASC, le.labevent_id ASC
                     LIMIT :chunk_limit
-                    """
-                ).bindparams(bindparam("itemids", expanding=True))
+                    """).bindparams(bindparam("itemids", expanding=True))
                 chunk_params: Dict[str, Any] = {
                     "stay_id": int(stay_id),
                     "hadm_id": int(hadm_id),
@@ -291,8 +299,7 @@ class MIMIC4DataExtractor:
                     "chunk_limit": int(current_limit),
                 }
             else:
-                chunk_sql = text(
-                    """
+                chunk_sql = text("""
                     SELECT
                         :stay_id AS stay_id,
                         le.charttime,
@@ -314,8 +321,7 @@ class MIMIC4DataExtractor:
                       )
                     ORDER BY le.charttime ASC, le.labevent_id ASC
                     LIMIT :chunk_limit
-                    """
-                )
+                    """)
                 chunk_params = {
                     "stay_id": int(stay_id),
                     "hadm_id": int(hadm_id),
@@ -333,19 +339,21 @@ class MIMIC4DataExtractor:
                     chunk_rows = [
                         dict(r)
                         for r in (
-                        self.session.execute(
-                            chunk_sql.execution_options(stream_results=True),
-                            chunk_params,
-                        )
-                        .mappings()
-                        .all()
+                            self.session.execute(
+                                chunk_sql.execution_options(stream_results=True),
+                                chunk_params,
+                            )
+                            .mappings()
+                            .all()
                         )
                     ]
                     break
                 except OperationalError as exc:
                     attempt += 1
                     self._reset_session_after_disconnect()
-                    if attempt >= int(max_retries) or not self._is_retryable_mysql_disconnect(exc):
+                    if attempt >= int(
+                        max_retries
+                    ) or not self._is_retryable_mysql_disconnect(exc):
                         raise
                     safe_batch_size = max(200, safe_batch_size // 2)
                     pytime.sleep(min(8.0, 0.8 * float(attempt)))
@@ -391,8 +399,7 @@ class MIMIC4DataExtractor:
             remaining = int(max_rows) - len(rows)
             current_limit = min(safe_batch_size, remaining)
 
-            chunk_sql = text(
-                """
+            chunk_sql = text("""
                 SELECT
                     ie.stay_id,
                     COALESCE(ie.starttime, ie.endtime) AS charttime,
@@ -433,8 +440,7 @@ class MIMIC4DataExtractor:
                     COALESCE(ie.orderid, 0) ASC,
                     ie.itemid ASC
                 LIMIT :chunk_limit
-                """
-            )
+                """)
             chunk_params: Dict[str, Any] = {
                 "hadm_id": int(hadm_id),
                 "stay_id": int(stay_id),
@@ -465,7 +471,9 @@ class MIMIC4DataExtractor:
                 except OperationalError as exc:
                     attempt += 1
                     self._reset_session_after_disconnect()
-                    if attempt >= int(max_retries) or not self._is_retryable_mysql_disconnect(exc):
+                    if attempt >= int(
+                        max_retries
+                    ) or not self._is_retryable_mysql_disconnect(exc):
                         raise
                     safe_batch_size = max(200, safe_batch_size // 2)
                     pytime.sleep(min(8.0, 0.8 * float(attempt)))
@@ -526,13 +534,17 @@ class MIMIC4DataExtractor:
         try:
             result = self.session.execute(text("DELETE FROM eligible_patients"))
             self.session.commit()
-            deleted_count = result.rowcount if hasattr(result, 'rowcount') else 0
+            deleted_count = result.rowcount if hasattr(result, "rowcount") else 0
             if deleted_count > 0:
-                logger.info(f"Cleared {deleted_count} existing records from eligible_patients")
+                logger.info(
+                    f"Cleared {deleted_count} existing records from eligible_patients"
+                )
             else:
                 logger.info("eligible_patients table is empty, starting fresh")
         except Exception as e:
-            logger.warning(f"Could not clear existing data (table may not exist yet): {e}")
+            logger.warning(
+                f"Could not clear existing data (table may not exist yet): {e}"
+            )
             self.session.rollback()
 
         # Build the query using SQLAlchemy
@@ -551,7 +563,9 @@ class MIMIC4DataExtractor:
         diagnosis_subq = (
             self.session.query(
                 DiagnosisICD.hadm_id,
-                func.count(func.distinct(DiagnosisICD.icd_code)).label("diagnosis_count"),
+                func.count(func.distinct(DiagnosisICD.icd_code)).label(
+                    "diagnosis_count"
+                ),
             )
             .group_by(DiagnosisICD.hadm_id)
             .having(func.count(func.distinct(DiagnosisICD.icd_code)) >= min_diagnoses)
@@ -571,7 +585,9 @@ class MIMIC4DataExtractor:
                 ).label("age_at_admission"),
                 Admission.admittime,
                 Admission.dischtime,
-                func.datediff(Admission.dischtime, Admission.admittime).label("los_days"),
+                func.datediff(Admission.dischtime, Admission.admittime).label(
+                    "los_days"
+                ),
                 Admission.admission_type,
                 Admission.hospital_expire_flag,
                 transfer_subq.c.transfer_count,
@@ -582,7 +598,8 @@ class MIMIC4DataExtractor:
             .join(diagnosis_subq, Admission.hadm_id == diagnosis_subq.c.hadm_id)
             .filter(
                 and_(
-                    func.datediff(Admission.dischtime, Admission.admittime) >= min_los_days,
+                    func.datediff(Admission.dischtime, Admission.admittime)
+                    >= min_los_days,
                     (
                         func.year(Admission.admittime)
                         - Patient.anchor_year
@@ -629,7 +646,7 @@ class MIMIC4DataExtractor:
                 raise
         else:
             logger.warning("No eligible patients found matching the criteria")
-            
+
         return count
 
     def get_eligible_patients_summary(self) -> Dict[str, Any]:
@@ -639,8 +656,12 @@ class MIMIC4DataExtractor:
             统计摘要字典
         """
         summary = self.session.query(
-            func.count(func.distinct(EligiblePatient.subject_id)).label("total_patients"),
-            func.count(func.distinct(EligiblePatient.hadm_id)).label("total_admissions"),
+            func.count(func.distinct(EligiblePatient.subject_id)).label(
+                "total_patients"
+            ),
+            func.count(func.distinct(EligiblePatient.hadm_id)).label(
+                "total_admissions"
+            ),
             func.avg(EligiblePatient.age_at_admission).label("avg_age"),
             func.avg(EligiblePatient.los_days).label("avg_los"),
             func.avg(EligiblePatient.transfer_count).label("avg_transfers"),
@@ -667,31 +688,31 @@ class MIMIC4DataExtractor:
         Returns:
             患者样本列表
         """
-        patients = (
-            self.session.query(EligiblePatient)
-            .limit(limit)
-            .all()
-        )
+        patients = self.session.query(EligiblePatient).limit(limit).all()
 
         result = []
         for p in patients:
-            result.append({
-                "subject_id": p.subject_id,
-                "hadm_id": p.hadm_id,
-                "gender": p.gender,
-                "age_at_admission": p.age_at_admission,
-                "admittime": p.admittime,
-                "dischtime": p.dischtime,
-                "los_days": p.los_days,
-                "admission_type": p.admission_type,
-                "hospital_expire_flag": p.hospital_expire_flag,
-                "transfer_count": p.transfer_count,
-                "diagnosis_count": p.diagnosis_count,
-            })
+            result.append(
+                {
+                    "subject_id": p.subject_id,
+                    "hadm_id": p.hadm_id,
+                    "gender": p.gender,
+                    "age_at_admission": p.age_at_admission,
+                    "admittime": p.admittime,
+                    "dischtime": p.dischtime,
+                    "los_days": p.los_days,
+                    "admission_type": p.admission_type,
+                    "hospital_expire_flag": p.hospital_expire_flag,
+                    "transfer_count": p.transfer_count,
+                    "diagnosis_count": p.diagnosis_count,
+                }
+            )
 
         return result
 
-    def get_patient_basic_info(self, hadm_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def get_patient_basic_info(
+        self, hadm_id: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         """查询1: 获取筛选患者的基本信息.
 
         Args:
@@ -724,7 +745,7 @@ class MIMIC4DataExtractor:
             query = query.filter(EligiblePatient.hadm_id == hadm_id)
 
         results = query.all()
-        
+
         return [
             {
                 "subject_id": r.subject_id,
@@ -744,7 +765,9 @@ class MIMIC4DataExtractor:
             for r in results
         ]
 
-    def get_admission_details(self, hadm_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def get_admission_details(
+        self, hadm_id: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         """查询2: 获取筛选患者的住院详情.
 
         Args:
@@ -753,25 +776,22 @@ class MIMIC4DataExtractor:
         Returns:
             住院详情列表
         """
-        query = (
-            self.session.query(
-                Admission.hadm_id,
-                Admission.subject_id,
-                Admission.admittime.label("入院时间"),
-                Admission.dischtime.label("出院时间"),
-                Admission.deathtime.label("死亡时间"),
-                func.datediff(Admission.dischtime, Admission.admittime).label("住院天数"),
-                Admission.admission_type.label("入院类型"),
-                Admission.admission_location.label("入院来源"),
-                Admission.discharge_location.label("出院去向"),
-                Admission.insurance,
-                Admission.language,
-                Admission.marital_status,
-                Admission.race,
-                Admission.hospital_expire_flag,
-            )
-            .join(EligiblePatient, Admission.hadm_id == EligiblePatient.hadm_id)
-        )
+        query = self.session.query(
+            Admission.hadm_id,
+            Admission.subject_id,
+            Admission.admittime.label("入院时间"),
+            Admission.dischtime.label("出院时间"),
+            Admission.deathtime.label("死亡时间"),
+            func.datediff(Admission.dischtime, Admission.admittime).label("住院天数"),
+            Admission.admission_type.label("入院类型"),
+            Admission.admission_location.label("入院来源"),
+            Admission.discharge_location.label("出院去向"),
+            Admission.insurance,
+            Admission.language,
+            Admission.marital_status,
+            Admission.race,
+            Admission.hospital_expire_flag,
+        ).join(EligiblePatient, Admission.hadm_id == EligiblePatient.hadm_id)
 
         if hadm_id:
             query = query.filter(Admission.hadm_id == hadm_id)
@@ -863,9 +883,9 @@ class MIMIC4DataExtractor:
                 Transfer.careunit.label("护理单元"),
                 Transfer.intime.label("入科时间"),
                 Transfer.outtime.label("出科时间"),
-                func.timestampdiff(text("HOUR"), Transfer.intime, Transfer.outtime).label(
-                    "停留小时数"
-                ),
+                func.timestampdiff(
+                    text("HOUR"), Transfer.intime, Transfer.outtime
+                ).label("停留小时数"),
             )
             .join(EligiblePatient, Transfer.hadm_id == EligiblePatient.hadm_id)
             .order_by(Transfer.subject_id, Transfer.intime)
@@ -916,7 +936,9 @@ class MIMIC4DataExtractor:
                     DiagnosisICD.icd_version == DICDDiagnosis.icd_version,
                 ),
             )
-            .order_by(DiagnosisICD.subject_id, DiagnosisICD.hadm_id, DiagnosisICD.seq_num)
+            .order_by(
+                DiagnosisICD.subject_id, DiagnosisICD.hadm_id, DiagnosisICD.seq_num
+            )
         )
 
         if hadm_id:
@@ -962,7 +984,9 @@ class MIMIC4DataExtractor:
                     ProcedureICD.icd_version == DICDProcedure.icd_version,
                 ),
             )
-            .order_by(ProcedureICD.subject_id, ProcedureICD.hadm_id, ProcedureICD.seq_num)
+            .order_by(
+                ProcedureICD.subject_id, ProcedureICD.hadm_id, ProcedureICD.seq_num
+            )
         )
 
         if hadm_id:
@@ -1083,8 +1107,7 @@ class MIMIC4DataExtractor:
         if hadm_id <= 0:
             raise ValueError("hadm_id must be positive")
 
-        windows_query = text(
-            """
+        windows_query = text("""
             SELECT
                 i.stay_id,
                 i.subject_id,
@@ -1100,8 +1123,7 @@ class MIMIC4DataExtractor:
               AND i.outtime IS NOT NULL
               AND i.outtime > i.intime
             ORDER BY i.intime ASC
-            """
-        )
+            """)
         windows_rows = self._execute_mappings_with_retry(
             windows_query,
             {"hadm_id": int(hadm_id), "stay_id": stay_id},
@@ -1111,7 +1133,11 @@ class MIMIC4DataExtractor:
 
         rows_out: List[Dict[str, Any]] = []
         default_chartevent_labels_top100 = tuple(
-            str(x).strip() for x in (chartevent_label_whitelist or DEFAULT_CHARTEVENT_LABEL_WHITELIST_TOP100) if str(x).strip()
+            str(x).strip()
+            for x in (
+                chartevent_label_whitelist or DEFAULT_CHARTEVENT_LABEL_WHITELIST_TOP100
+            )
+            if str(x).strip()
         )
 
         for w in windows_rows:
@@ -1126,8 +1152,7 @@ class MIMIC4DataExtractor:
                     query_intime = clipped_start
 
             if include_all_chartevents:
-                chart_sql = text(
-                    """
+                chart_sql = text("""
                     SELECT
                         ce.stay_id,
                         ce.charttime,
@@ -1144,8 +1169,7 @@ class MIMIC4DataExtractor:
                       AND ce.valuenum IS NOT NULL
                     ORDER BY ce.charttime ASC
                     LIMIT :max_rows
-                    """
-                )
+                    """)
                 chart_params = {
                     "hadm_id": int(hadm_id),
                     "stay_id": cur_stay_id,
@@ -1154,8 +1178,7 @@ class MIMIC4DataExtractor:
                     "max_rows": int(max_rows),
                 }
             elif vital_itemids:
-                chart_sql = text(
-                    """
+                chart_sql = text("""
                     SELECT
                         ce.stay_id,
                         ce.charttime,
@@ -1173,8 +1196,7 @@ class MIMIC4DataExtractor:
                       AND ce.itemid IN :itemids
                     ORDER BY ce.charttime ASC
                     LIMIT :max_rows
-                    """
-                ).bindparams(bindparam("itemids", expanding=True))
+                    """).bindparams(bindparam("itemids", expanding=True))
                 chart_params = {
                     "hadm_id": int(hadm_id),
                     "stay_id": cur_stay_id,
@@ -1184,8 +1206,7 @@ class MIMIC4DataExtractor:
                     "max_rows": int(max_rows),
                 }
             else:
-                chart_sql = text(
-                    """
+                chart_sql = text("""
                     SELECT
                         ce.stay_id,
                         ce.charttime,
@@ -1203,14 +1224,13 @@ class MIMIC4DataExtractor:
                                             AND di.label IN :labels
                     ORDER BY ce.charttime ASC
                     LIMIT :max_rows
-                    """
-                                ).bindparams(bindparam("labels", expanding=True))
+                    """).bindparams(bindparam("labels", expanding=True))
                 chart_params = {
                     "hadm_id": int(hadm_id),
                     "stay_id": cur_stay_id,
                     "intime": query_intime,
                     "outtime": outtime,
-                                        "labels": list(default_chartevent_labels_top100),
+                    "labels": list(default_chartevent_labels_top100),
                     "max_rows": int(max_rows),
                 }
 
@@ -1229,8 +1249,7 @@ class MIMIC4DataExtractor:
             )
 
             if include_outputevents:
-                output_sql = text(
-                    """
+                output_sql = text("""
                     SELECT
                         oe.stay_id,
                         oe.charttime,
@@ -1247,8 +1266,7 @@ class MIMIC4DataExtractor:
                       AND oe.value IS NOT NULL
                     ORDER BY oe.charttime ASC
                     LIMIT :max_rows
-                    """
-                )
+                    """)
                 output_rows = self._execute_mappings_with_retry(
                     output_sql,
                     {
@@ -1273,8 +1291,7 @@ class MIMIC4DataExtractor:
                 )
 
             if include_datetimeevents:
-                datetime_sql = text(
-                    """
+                datetime_sql = text("""
                     SELECT
                         de.stay_id,
                         de.charttime,
@@ -1290,8 +1307,7 @@ class MIMIC4DataExtractor:
                       AND de.charttime <= :outtime
                     ORDER BY de.charttime ASC
                     LIMIT :max_rows
-                    """
-                )
+                    """)
                 dt_rows = self._execute_mappings_with_retry(
                     datetime_sql,
                     {
@@ -1360,8 +1376,7 @@ class MIMIC4DataExtractor:
                 )
 
             if include_omr:
-                omr_sql = text(
-                    """
+                omr_sql = text("""
                     SELECT
                         o.chartdate,
                         o.result_name,
@@ -1372,8 +1387,7 @@ class MIMIC4DataExtractor:
                       AND o.chartdate <= DATE(:outtime)
                     ORDER BY o.chartdate ASC
                     LIMIT :max_rows
-                    """
-                )
+                    """)
                 omr_rows = self._execute_mappings_with_retry(
                     omr_sql,
                     {
@@ -1392,7 +1406,11 @@ class MIMIC4DataExtractor:
                     result_value = r.get("result_value")
                     lower_name = result_name.lower()
 
-                    if "blood pressure" in lower_name and isinstance(result_value, str) and "/" in result_value:
+                    if (
+                        "blood pressure" in lower_name
+                        and isinstance(result_value, str)
+                        and "/" in result_value
+                    ):
                         sbp, dbp = self._parse_bp_pair(result_value)
                         if sbp is not None:
                             rows_out.append(
@@ -1483,254 +1501,382 @@ class MIMIC4DataExtractor:
         out_payloads: Dict[int, Dict[str, Any]] = {}
         if not stay_rows:
             return out_payloads
-            
+
         default_chartevent_labels_top100 = tuple(
-            str(x).strip() for x in (chartevent_label_whitelist or DEFAULT_CHARTEVENT_LABEL_WHITELIST_TOP100) if str(x).strip()
+            str(x).strip()
+            for x in (
+                chartevent_label_whitelist or DEFAULT_CHARTEVENT_LABEL_WHITELIST_TOP100
+            )
+            if str(x).strip()
         )
-        
+
         # We will process stay_rows in chunks to avoid overly large IN (...) clauses
         for i in range(0, len(stay_rows), batch_size):
-            chunk_rows = stay_rows[i:i + batch_size]
+            chunk_rows = stay_rows[i : i + batch_size]
             chunk_stay_ids = []
             chunk_hadm_ids = set()
             chunk_subject_ids = set()
-            
+
             # Extract attributes dynamically (supports dict or dataclass)
             stay_map = {}
             for s in chunk_rows:
-                sid = int(getattr(s, "stay_id", s.get("stay_id") if isinstance(s, dict) else 0))
-                hid = int(getattr(s, "hadm_id", s.get("hadm_id") if isinstance(s, dict) else 0))
-                sub_id = int(getattr(s, "subject_id", s.get("subject_id") if isinstance(s, dict) else 0))
+                sid = int(
+                    getattr(
+                        s, "stay_id", s.get("stay_id") if isinstance(s, dict) else 0
+                    )
+                )
+                hid = int(
+                    getattr(
+                        s, "hadm_id", s.get("hadm_id") if isinstance(s, dict) else 0
+                    )
+                )
+                sub_id = int(
+                    getattr(
+                        s,
+                        "subject_id",
+                        s.get("subject_id") if isinstance(s, dict) else 0,
+                    )
+                )
                 chunk_stay_ids.append(sid)
                 chunk_hadm_ids.add(hid)
                 chunk_subject_ids.add(sub_id)
-                
+
                 # compute window query limits per stay
-                intime = getattr(s, "intime", s.get("intime") if isinstance(s, dict) else None)
-                outtime = getattr(s, "outtime", s.get("outtime") if isinstance(s, dict) else None)
-                
+                intime = getattr(
+                    s, "intime", s.get("intime") if isinstance(s, dict) else None
+                )
+                outtime = getattr(
+                    s, "outtime", s.get("outtime") if isinstance(s, dict) else None
+                )
+
                 query_intime = intime
-                if pre_discharge_hours is not None and int(pre_discharge_hours) > 0 and outtime is not None:
+                if (
+                    pre_discharge_hours is not None
+                    and int(pre_discharge_hours) > 0
+                    and outtime is not None
+                ):
                     clipped_start = outtime - timedelta(hours=int(pre_discharge_hours))
                     if clipped_start > query_intime:
                         query_intime = clipped_start
-                        
+
                 stay_map[sid] = {
-                    "stay_id": sid, "hadm_id": hid, "subject_id": sub_id,
-                    "intime": intime, "outtime": outtime, "query_intime": query_intime
+                    "stay_id": sid,
+                    "hadm_id": hid,
+                    "subject_id": sub_id,
+                    "intime": intime,
+                    "outtime": outtime,
+                    "query_intime": query_intime,
                 }
                 out_payloads[sid] = {
                     "hadm_id": hid,
                     "vital_label_hints": list(default_chartevent_labels_top100),
-                    "windows": [{
-                        "stay_id": sid, "subject_id": sub_id,
-                        "intime": intime, "outtime": outtime,
-                        "admittime": getattr(s, "admittime", intime), # Fallback to intime if admittime not provided
-                        "dischtime": getattr(s, "dischtime", outtime),
-                    }],
-                    "x_t": []
+                    "windows": [
+                        {
+                            "stay_id": sid,
+                            "subject_id": sub_id,
+                            "intime": intime,
+                            "outtime": outtime,
+                            "admittime": getattr(
+                                s, "admittime", intime
+                            ),  # Fallback to intime if admittime not provided
+                            "dischtime": getattr(s, "dischtime", outtime),
+                        }
+                    ],
+                    "x_t": [],
                 }
-            
+
             chunk_hadm_ids = list(chunk_hadm_ids)
             chunk_subject_ids = list(chunk_subject_ids)
-            
+
             # Fetch chartevents
             if include_all_chartevents:
-                chart_sql = text(
-                    """
+                chart_sql = text("""
                     SELECT ce.stay_id, ce.charttime, ce.itemid, di.label AS feature, ce.valuenum AS value, ce.valueuom
                     FROM chartevents ce INNER JOIN d_items di ON di.itemid = ce.itemid
                     WHERE ce.stay_id IN :stay_ids AND ce.valuenum IS NOT NULL
-                    """
-                ).bindparams(bindparam("stay_ids", expanding=True))
+                    """).bindparams(bindparam("stay_ids", expanding=True))
                 chart_params = {"stay_ids": chunk_stay_ids}
             elif vital_itemids:
-                chart_sql = text(
-                    """
+                chart_sql = text("""
                     SELECT ce.stay_id, ce.charttime, ce.itemid, di.label AS feature, ce.valuenum AS value, ce.valueuom
                     FROM chartevents ce INNER JOIN d_items di ON di.itemid = ce.itemid
                     WHERE ce.stay_id IN :stay_ids AND ce.valuenum IS NOT NULL AND ce.itemid IN :itemids
-                    """
-                ).bindparams(bindparam("stay_ids", expanding=True), bindparam("itemids", expanding=True))
-                chart_params = {"stay_ids": chunk_stay_ids, "itemids": [int(x) for x in vital_itemids]}
+                    """).bindparams(
+                    bindparam("stay_ids", expanding=True),
+                    bindparam("itemids", expanding=True),
+                )
+                chart_params = {
+                    "stay_ids": chunk_stay_ids,
+                    "itemids": [int(x) for x in vital_itemids],
+                }
             else:
-                chart_sql = text(
-                    """
+                chart_sql = text("""
                     SELECT ce.stay_id, ce.charttime, ce.itemid, di.label AS feature, ce.valuenum AS value, ce.valueuom
                     FROM chartevents ce INNER JOIN d_items di ON di.itemid = ce.itemid
                     WHERE ce.stay_id IN :stay_ids AND ce.valuenum IS NOT NULL AND di.label IN :labels
-                    """
-                ).bindparams(bindparam("stay_ids", expanding=True), bindparam("labels", expanding=True))
-                chart_params = {"stay_ids": chunk_stay_ids, "labels": list(default_chartevent_labels_top100)}
-            
+                    """).bindparams(
+                    bindparam("stay_ids", expanding=True),
+                    bindparam("labels", expanding=True),
+                )
+                chart_params = {
+                    "stay_ids": chunk_stay_ids,
+                    "labels": list(default_chartevent_labels_top100),
+                }
+
             chart_rows = self._execute_mappings_with_retry(chart_sql, chart_params)
             for r in chart_rows:
                 sid = int(r["stay_id"])
                 # Python side filtering for intime/outtime
-                if r["charttime"] is None or r["charttime"] < stay_map[sid]["query_intime"] or r["charttime"] > stay_map[sid]["outtime"]:
+                if (
+                    r["charttime"] is None
+                    or r["charttime"] < stay_map[sid]["query_intime"]
+                    or r["charttime"] > stay_map[sid]["outtime"]
+                ):
                     continue
-                out_payloads[sid]["x_t"].append({
-                    "stay_id": sid, "charttime": r["charttime"], "source": "chartevents",
-                    "itemid": int(r["itemid"]), "feature": str(r.get("feature") or ""),
-                    "value": float(r["value"]), "valueuom": str(r.get("valueuom") or "")
-                })
+                out_payloads[sid]["x_t"].append(
+                    {
+                        "stay_id": sid,
+                        "charttime": r["charttime"],
+                        "source": "chartevents",
+                        "itemid": int(r["itemid"]),
+                        "feature": str(r.get("feature") or ""),
+                        "value": float(r["value"]),
+                        "valueuom": str(r.get("valueuom") or ""),
+                    }
+                )
 
             # Fetch outputevents
             if include_outputevents:
-                output_sql = text(
-                    """
+                output_sql = text("""
                     SELECT oe.stay_id, oe.charttime, oe.itemid, di.label AS feature, oe.value, oe.valueuom
                     FROM outputevents oe INNER JOIN d_items di ON di.itemid = oe.itemid
                     WHERE oe.stay_id IN :stay_ids AND oe.value IS NOT NULL
-                    """
-                ).bindparams(bindparam("stay_ids", expanding=True))
-                output_rows = self._execute_mappings_with_retry(output_sql, {"stay_ids": chunk_stay_ids})
+                    """).bindparams(bindparam("stay_ids", expanding=True))
+                output_rows = self._execute_mappings_with_retry(
+                    output_sql, {"stay_ids": chunk_stay_ids}
+                )
                 for r in output_rows:
                     sid = int(r["stay_id"])
-                    if r["charttime"] is None or r["charttime"] < stay_map[sid]["query_intime"] or r["charttime"] > stay_map[sid]["outtime"]:
+                    if (
+                        r["charttime"] is None
+                        or r["charttime"] < stay_map[sid]["query_intime"]
+                        or r["charttime"] > stay_map[sid]["outtime"]
+                    ):
                         continue
-                    out_payloads[sid]["x_t"].append({
-                        "stay_id": sid, "charttime": r["charttime"], "source": "outputevents",
-                        "itemid": int(r["itemid"]), "feature": str(r.get("feature") or ""),
-                        "value": float(r["value"]), "valueuom": str(r.get("valueuom") or "")
-                    })
+                    out_payloads[sid]["x_t"].append(
+                        {
+                            "stay_id": sid,
+                            "charttime": r["charttime"],
+                            "source": "outputevents",
+                            "itemid": int(r["itemid"]),
+                            "feature": str(r.get("feature") or ""),
+                            "value": float(r["value"]),
+                            "valueuom": str(r.get("valueuom") or ""),
+                        }
+                    )
 
             # Fetch datetimeevents
             if include_datetimeevents:
-                datetime_sql = text(
-                    """
+                datetime_sql = text("""
                     SELECT de.stay_id, de.charttime, de.itemid, di.label AS feature, 1.0 AS value, '' AS valueuom
                     FROM datetimeevents de INNER JOIN d_items di ON di.itemid = de.itemid
                     WHERE de.stay_id IN :stay_ids
-                    """
-                ).bindparams(bindparam("stay_ids", expanding=True))
-                dt_rows = self._execute_mappings_with_retry(datetime_sql, {"stay_ids": chunk_stay_ids})
+                    """).bindparams(bindparam("stay_ids", expanding=True))
+                dt_rows = self._execute_mappings_with_retry(
+                    datetime_sql, {"stay_ids": chunk_stay_ids}
+                )
                 for r in dt_rows:
                     sid = int(r["stay_id"])
-                    if r["charttime"] is None or r["charttime"] < stay_map[sid]["query_intime"] or r["charttime"] > stay_map[sid]["outtime"]:
+                    if (
+                        r["charttime"] is None
+                        or r["charttime"] < stay_map[sid]["query_intime"]
+                        or r["charttime"] > stay_map[sid]["outtime"]
+                    ):
                         continue
-                    out_payloads[sid]["x_t"].append({
-                        "stay_id": sid, "charttime": r["charttime"], "source": "datetimeevents",
-                        "itemid": int(r["itemid"]), "feature": str(r.get("feature") or ""),
-                        "value": float(r["value"]), "valueuom": ""
-                    })
+                    out_payloads[sid]["x_t"].append(
+                        {
+                            "stay_id": sid,
+                            "charttime": r["charttime"],
+                            "source": "datetimeevents",
+                            "itemid": int(r["itemid"]),
+                            "feature": str(r.get("feature") or ""),
+                            "value": float(r["value"]),
+                            "valueuom": "",
+                        }
+                    )
 
             # Fetch labevents
             if include_labevents and chunk_hadm_ids:
                 if lab_itemids:
-                    lab_sql = text(
-                        """
+                    lab_sql = text("""
                         SELECT le.hadm_id, le.charttime, le.itemid, le.labevent_id,
                                COALESCE(dl.label, CONCAT('LAB:', CAST(le.itemid AS CHAR))) AS feature,
                                le.valuenum AS value, le.valueuom
                         FROM labevents le LEFT JOIN d_labitems dl ON dl.itemid = le.itemid
                         WHERE le.hadm_id IN :hadm_ids AND le.valuenum IS NOT NULL AND le.itemid IN :itemids
-                        """
-                    ).bindparams(bindparam("hadm_ids", expanding=True), bindparam("itemids", expanding=True))
-                    lab_params = {"hadm_ids": chunk_hadm_ids, "itemids": [int(x) for x in lab_itemids]}
+                        """).bindparams(
+                        bindparam("hadm_ids", expanding=True),
+                        bindparam("itemids", expanding=True),
+                    )
+                    lab_params = {
+                        "hadm_ids": chunk_hadm_ids,
+                        "itemids": [int(x) for x in lab_itemids],
+                    }
                 else:
-                    lab_sql = text(
-                        """
+                    lab_sql = text("""
                         SELECT le.hadm_id, le.charttime, le.itemid, le.labevent_id,
                                COALESCE(dl.label, CONCAT('LAB:', CAST(le.itemid AS CHAR))) AS feature,
                                le.valuenum AS value, le.valueuom
                         FROM labevents le LEFT JOIN d_labitems dl ON dl.itemid = le.itemid
                         WHERE le.hadm_id IN :hadm_ids AND le.valuenum IS NOT NULL
-                        """
-                    ).bindparams(bindparam("hadm_ids", expanding=True))
+                        """).bindparams(bindparam("hadm_ids", expanding=True))
                     lab_params = {"hadm_ids": chunk_hadm_ids}
-                
+
                 lab_rows = self._execute_mappings_with_retry(lab_sql, lab_params)
                 for r in lab_rows:
                     hid = int(r["hadm_id"])
                     # Find matching stay_id based on hadm_id and time bounds
                     for sid, info in stay_map.items():
-                        if info["hadm_id"] == hid and r["charttime"] is not None and info["query_intime"] <= r["charttime"] <= info["outtime"]:
-                            out_payloads[sid]["x_t"].append({
-                                "stay_id": sid, "charttime": r["charttime"], "source": "labevents",
-                                "itemid": int(r["itemid"]), "feature": str(r.get("feature") or ""),
-                                "value": float(r["value"]), "valueuom": str(r.get("valueuom") or "")
-                            })
+                        if (
+                            info["hadm_id"] == hid
+                            and r["charttime"] is not None
+                            and info["query_intime"]
+                            <= r["charttime"]
+                            <= info["outtime"]
+                        ):
+                            out_payloads[sid]["x_t"].append(
+                                {
+                                    "stay_id": sid,
+                                    "charttime": r["charttime"],
+                                    "source": "labevents",
+                                    "itemid": int(r["itemid"]),
+                                    "feature": str(r.get("feature") or ""),
+                                    "value": float(r["value"]),
+                                    "valueuom": str(r.get("valueuom") or ""),
+                                }
+                            )
 
             # Fetch inputevents
             if include_inputevents:
-                input_sql = text(
-                    """
+                input_sql = text("""
                     SELECT ie.stay_id, COALESCE(ie.starttime, ie.endtime) AS charttime, ie.itemid,
                            di.label AS feature,
                            CASE WHEN ie.amount IS NOT NULL THEN ie.amount WHEN ie.rate IS NOT NULL THEN ie.rate ELSE NULL END AS value,
                            CASE WHEN ie.amount IS NOT NULL THEN ie.amountuom ELSE ie.rateuom END AS valueuom
                     FROM inputevents ie INNER JOIN d_items di ON di.itemid = ie.itemid
                     WHERE ie.stay_id IN :stay_ids AND (ie.amount IS NOT NULL OR ie.rate IS NOT NULL)
-                    """
-                ).bindparams(bindparam("stay_ids", expanding=True))
-                input_rows = self._execute_mappings_with_retry(input_sql, {"stay_ids": chunk_stay_ids})
+                    """).bindparams(bindparam("stay_ids", expanding=True))
+                input_rows = self._execute_mappings_with_retry(
+                    input_sql, {"stay_ids": chunk_stay_ids}
+                )
                 for r in input_rows:
                     sid = int(r["stay_id"])
-                    if r["charttime"] is None or r["charttime"] < stay_map[sid]["query_intime"] or r["charttime"] > stay_map[sid]["outtime"]:
+                    if (
+                        r["charttime"] is None
+                        or r["charttime"] < stay_map[sid]["query_intime"]
+                        or r["charttime"] > stay_map[sid]["outtime"]
+                    ):
                         continue
-                    out_payloads[sid]["x_t"].append({
-                        "stay_id": sid, "charttime": r["charttime"], "source": "inputevents",
-                        "itemid": int(r["itemid"]), "feature": f"INPUT {str(r.get('feature') or '')}",
-                        "value": float(r["value"]), "valueuom": str(r.get("valueuom") or "")
-                    })
+                    out_payloads[sid]["x_t"].append(
+                        {
+                            "stay_id": sid,
+                            "charttime": r["charttime"],
+                            "source": "inputevents",
+                            "itemid": int(r["itemid"]),
+                            "feature": f"INPUT {str(r.get('feature') or '')}",
+                            "value": float(r["value"]),
+                            "valueuom": str(r.get("valueuom") or ""),
+                        }
+                    )
 
             # Fetch omr
             if include_omr and chunk_subject_ids:
-                omr_sql = text(
-                    """
+                omr_sql = text("""
                     SELECT o.subject_id, o.chartdate, o.result_name, o.result_value
                     FROM omr o
                     WHERE o.subject_id IN :subject_ids
-                    """
-                ).bindparams(bindparam("subject_ids", expanding=True))
-                omr_rows = self._execute_mappings_with_retry(omr_sql, {"subject_ids": chunk_subject_ids})
+                    """).bindparams(bindparam("subject_ids", expanding=True))
+                omr_rows = self._execute_mappings_with_retry(
+                    omr_sql, {"subject_ids": chunk_subject_ids}
+                )
                 for r in omr_rows:
                     sub_id = int(r["subject_id"])
                     charttime = self._coerce_charttime(r.get("chartdate"))
                     if charttime is None:
                         continue
-                        
+
                     for sid, info in stay_map.items():
-                        if info["subject_id"] == sub_id and info["query_intime"].date() <= charttime.date() <= info["outtime"].date():
+                        if (
+                            info["subject_id"] == sub_id
+                            and info["query_intime"].date()
+                            <= charttime.date()
+                            <= info["outtime"].date()
+                        ):
                             result_name = str(r.get("result_name") or "").strip()
                             result_value = r.get("result_value")
                             lower_name = result_name.lower()
-                            
-                            if "blood pressure" in lower_name and isinstance(result_value, str) and "/" in result_value:
+
+                            if (
+                                "blood pressure" in lower_name
+                                and isinstance(result_value, str)
+                                and "/" in result_value
+                            ):
                                 sbp, dbp = self._parse_bp_pair(result_value)
                                 if sbp is not None:
-                                    out_payloads[sid]["x_t"].append({
-                                        "stay_id": sid, "charttime": charttime, "source": "omr", "itemid": 0,
-                                        "feature": "Blood Pressure Systolic", "value": float(sbp), "valueuom": "mmHg"
-                                    })
+                                    out_payloads[sid]["x_t"].append(
+                                        {
+                                            "stay_id": sid,
+                                            "charttime": charttime,
+                                            "source": "omr",
+                                            "itemid": 0,
+                                            "feature": "Blood Pressure Systolic",
+                                            "value": float(sbp),
+                                            "valueuom": "mmHg",
+                                        }
+                                    )
                                 if dbp is not None:
-                                    out_payloads[sid]["x_t"].append({
-                                        "stay_id": sid, "charttime": charttime, "source": "omr", "itemid": 0,
-                                        "feature": "Blood Pressure Diastolic", "value": float(dbp), "valueuom": "mmHg"
-                                    })
+                                    out_payloads[sid]["x_t"].append(
+                                        {
+                                            "stay_id": sid,
+                                            "charttime": charttime,
+                                            "source": "omr",
+                                            "itemid": 0,
+                                            "feature": "Blood Pressure Diastolic",
+                                            "value": float(dbp),
+                                            "valueuom": "mmHg",
+                                        }
+                                    )
                                 continue
-                                
+
                             fv = self._try_parse_float(result_value)
                             if fv is None:
                                 continue
-                            out_payloads[sid]["x_t"].append({
-                                "stay_id": sid, "charttime": charttime, "source": "omr", "itemid": 0,
-                                "feature": f"OMR {result_name}" if result_name else "OMR",
-                                "value": float(fv), "valueuom": ""
-                            })
+                            out_payloads[sid]["x_t"].append(
+                                {
+                                    "stay_id": sid,
+                                    "charttime": charttime,
+                                    "source": "omr",
+                                    "itemid": 0,
+                                    "feature": (
+                                        f"OMR {result_name}" if result_name else "OMR"
+                                    ),
+                                    "value": float(fv),
+                                    "valueuom": "",
+                                }
+                            )
 
         # Sort all x_t arrays
         for sid, payload in out_payloads.items():
             payload["x_t"].sort(
                 key=lambda x: (
                     self._coerce_charttime(x.get("charttime")) or datetime.min,
-                    x["stay_id"], x["source"], x["itemid"]
+                    x["stay_id"],
+                    x["source"],
+                    x["itemid"],
                 )
             )
 
         return out_payloads
-
 
     def get_complete_patient_data(self, hadm_id: int) -> Dict[str, Any]:
         """获取单个患者的完整数据（适用于博弈分析）.
@@ -1794,10 +1940,12 @@ def extract_and_export_sample_data(
         return result
     elif output_format == "json":
         import json
+
         return json.dumps(result, ensure_ascii=False, indent=2, default=str)
     elif output_format == "dataframe":
         try:
             import pandas as pd
+
             return {
                 "summary": pd.DataFrame([summary]),
                 "sample_patients": pd.DataFrame(sample_patients),

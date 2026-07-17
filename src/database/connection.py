@@ -1,10 +1,12 @@
 """Database connection manager."""
 
-from typing import Optional, Any
 import logging
+from typing import Any, Optional
+
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
+
 from .config import DatabaseConfig
 
 logger = logging.getLogger(__name__)

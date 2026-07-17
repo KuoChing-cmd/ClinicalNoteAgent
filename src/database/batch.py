@@ -1,7 +1,8 @@
 """Batch operations for database models."""
 
-from typing import List, Dict, Any, Type, TypeVar
 import logging
+from typing import Any, Dict, List, Type, TypeVar
+
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -55,9 +56,11 @@ class BatchOperations:
             count = 0
             for update_data in updates:
                 obj_id = update_data.pop("id")
-                obj = self.session.query(self.model).filter(
-                    self.model.id == obj_id
-                ).first()
+                obj = (
+                    self.session.query(self.model)
+                    .filter(self.model.id == obj_id)
+                    .first()
+                )
                 if obj:
                     for key, value in update_data.items():
                         setattr(obj, key, value)
@@ -80,9 +83,11 @@ class BatchOperations:
             Number of records deleted
         """
         try:
-            count = self.session.query(self.model).filter(
-                self.model.id.in_(obj_ids)
-            ).delete()
+            count = (
+                self.session.query(self.model)
+                .filter(self.model.id.in_(obj_ids))
+                .delete()
+            )
             self.session.commit()
             logger.info(f"Batch deleted {count} records")
             return count
@@ -106,9 +111,11 @@ class BatchOperations:
                 obj_id = data.get("id")
                 if obj_id:
                     # Update existing
-                    obj = self.session.query(self.model).filter(
-                        self.model.id == obj_id
-                    ).first()
+                    obj = (
+                        self.session.query(self.model)
+                        .filter(self.model.id == obj_id)
+                        .first()
+                    )
                     if obj:
                         for key, value in data.items():
                             if key != "id":

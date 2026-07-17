@@ -12,7 +12,9 @@ import torch.nn as nn
 class MonitoringLSTMPolicy(nn.Module):
     """LSTM policy that outputs discharge aggressiveness in [0, 1]."""
 
-    def __init__(self, input_size: int = 3, hidden_size: int = 64, num_layers: int = 1) -> None:
+    def __init__(
+        self, input_size: int = 3, hidden_size: int = 64, num_layers: int = 1
+    ) -> None:
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=input_size,
@@ -87,43 +89,85 @@ class MonitoringAgent:
     # Keep a stable canonical channel order for training/evaluation.
     DEFAULT_CHANNELS: list[str] = [
         # Vital signs
-        "HR", "RR", "SPO2", "TEMP",
+        "HR",
+        "RR",
+        "SPO2",
+        "TEMP",
         # Hemodynamics
-        "SBP", "DBP", "MAP", "CVP", "PAP", "PAPS", "PAPD", "PAWP", "ICP",
+        "SBP",
+        "DBP",
+        "MAP",
+        "CVP",
+        "PAP",
+        "PAPS",
+        "PAPD",
+        "PAWP",
+        "ICP",
         # Blood gases
-        "pH", "PCO2", "PO2", "HCO3",
+        "pH",
+        "PCO2",
+        "PO2",
+        "HCO3",
         # Metabolic
-        "GLUCOSE", "LACTATE",
+        "GLUCOSE",
+        "LACTATE",
         # Renal
-        "CREATININE", "BUN",
+        "CREATININE",
+        "BUN",
         # Electrolytes
-        "K", "NA", "CL", "CA", "MG", "PHOS",
+        "K",
+        "NA",
+        "CL",
+        "CA",
+        "MG",
+        "PHOS",
         # Cell counts
-        "WBC", "HGB", "HCT", "PLT",
+        "WBC",
+        "HGB",
+        "HCT",
+        "PLT",
         # Coagulation
-        "PT", "PTT",
+        "PT",
+        "PTT",
         # Liver
-        "ALB", "BILI", "AST", "ALT", "ALP",
+        "ALB",
+        "BILI",
+        "AST",
+        "ALT",
+        "ALP",
         # Output
-        "UO", "DRAIN",
+        "UO",
+        "DRAIN",
     ]
 
     # High-density + clinically core channels used for default pruning.
     DEFAULT_CORE_CHANNELS: list[str] = [
-        "HR", "RR", "SPO2", "TEMP",
-        "SBP", "DBP", "MAP",
-        "GLUCOSE", "LACTATE",
-        "CREATININE", "BUN",
-        "K", "NA", "CL",
-        "WBC", "HGB", "PLT",
-        "PTT", "HCO3",
+        "HR",
+        "RR",
+        "SPO2",
+        "TEMP",
+        "SBP",
+        "DBP",
+        "MAP",
+        "GLUCOSE",
+        "LACTATE",
+        "CREATININE",
+        "BUN",
+        "K",
+        "NA",
+        "CL",
+        "WBC",
+        "HGB",
+        "PLT",
+        "PTT",
+        "HCO3",
         "UO",
     ]
 
     @staticmethod
     def _normalize_sign_value(feature: str, value: float) -> float:
         """Map heterogeneous ICU event values to [0, 1] sign-intensity scale.
-        
+
         Supports 40+ clinical variables with physiologically-informed normalization ranges.
         """
         name = str(feature or "").strip().lower()
@@ -138,7 +182,7 @@ class MonitoringAgent:
             return float(np.clip((v - 8.0) / 32.0, 0.0, 1.0))
         if "temperature" in name:
             return float(np.clip((v - 34.0) / 8.0, 0.0, 1.0))
-        
+
         # Hemodynamics (pressure in mmHg)
         is_map_alias = (
             "mean arterial pressure" in name
@@ -159,14 +203,19 @@ class MonitoringAgent:
             or "pcwp" in name
             or "ra (mean) pressure" in name
         )
-        if (
-            is_map_alias
-            and not is_non_map_mean_pressure
-        ):
+        if is_map_alias and not is_non_map_mean_pressure:
             return float(np.clip((v - 40.0) / 80.0, 0.0, 1.0))
-        if ("blood pressure" in name or "arterial blood pressure" in name or "nibp" in name) and "systolic" in name:
+        if (
+            "blood pressure" in name
+            or "arterial blood pressure" in name
+            or "nibp" in name
+        ) and "systolic" in name:
             return float(np.clip((v - 70.0) / 110.0, 0.0, 1.0))
-        if ("blood pressure" in name or "arterial blood pressure" in name or "nibp" in name) and "diastolic" in name:
+        if (
+            "blood pressure" in name
+            or "arterial blood pressure" in name
+            or "nibp" in name
+        ) and "diastolic" in name:
             return float(np.clip((v - 30.0) / 70.0, 0.0, 1.0))
         if "central venous pressure" in name or "cvp" in name or "jvp" in name:
             return float(np.clip((v - 2.0) / 12.0, 0.0, 1.0))
@@ -180,7 +229,7 @@ class MonitoringAgent:
             return float(np.clip((v - 5.0) / 20.0, 0.0, 1.0))
         if "intracranial pressure" in name or "icp" in name:
             return float(np.clip((v - 5.0) / 15.0, 0.0, 1.0))
-        
+
         # Blood gases (ABG/VBG)
         if "ph" in name and ("blood" in name or "arterial" in name or "venous" in name):
             return float(np.clip((v - 7.2) / 0.3, 0.0, 1.0))
@@ -188,15 +237,20 @@ class MonitoringAgent:
             return float(np.clip((v - 30.0) / 40.0, 0.0, 1.0))
         if "po2" in name or "po₂" in name or "partial pressure o2" in name:
             return float(np.clip((v - 50.0) / 100.0, 0.0, 1.0))
-        if "bicarbonate" in name or "hco3" in name or "hco₃" in name or "co2 content" in name:
+        if (
+            "bicarbonate" in name
+            or "hco3" in name
+            or "hco₃" in name
+            or "co2 content" in name
+        ):
             return float(np.clip((v - 15.0) / 25.0, 0.0, 1.0))
-        
+
         # Metabolic
         if "glucose" in name or "blood glucose" in name or "blood sugar" in name:
             return float(np.clip((v - 70.0) / 180.0, 0.0, 1.0))
         if "lactate" in name or "lactic acid" in name:
             return float(np.clip((v - 0.5) / 4.0, 0.0, 1.0))
-        
+
         # Renal
         is_creat = "creatinine" in name
         is_creat_excluded = (
@@ -215,7 +269,7 @@ class MonitoringAgent:
             return float(np.clip((v - 0.5) / 3.0, 0.0, 1.0))
         if "bun" in name or "urea nitrogen" in name:
             return float(np.clip((v - 10.0) / 50.0, 0.0, 1.0))
-        
+
         # Electrolytes (mEq/L)
         if "potassium" in name or "k+" in name:
             return float(np.clip((v - 3.0) / 2.0, 0.0, 1.0))
@@ -229,7 +283,7 @@ class MonitoringAgent:
             return float(np.clip((v - 1.5) / 1.5, 0.0, 1.0))
         if "phosphate" in name or "phosphorus" in name:
             return float(np.clip((v - 2.0) / 3.0, 0.0, 1.0))
-        
+
         # Cell counts
         if "wbc" in name or "white blood cell" in name:
             return float(np.clip((v - 4.0) / 12.0, 0.0, 1.0))
@@ -239,7 +293,7 @@ class MonitoringAgent:
             return float(np.clip((v - 25.0) / 40.0, 0.0, 1.0))
         if "platelet" in name or "plt" in name:
             return float(np.clip((v - 100.0) / 150.0, 0.0, 1.0))
-        
+
         # Coagulation (time in seconds)
         if "pt" in name and "partial thromboplastin" not in name:
             return float(np.clip((v - 12.0) / 10.0, 0.0, 1.0))
@@ -247,7 +301,7 @@ class MonitoringAgent:
             return float(np.clip((v - 30.0) / 30.0, 0.0, 1.0))
         if "inr" in name:
             return float(np.clip((v - 1.0) / 2.0, 0.0, 1.0))
-        
+
         # Liver
         if "albumin" in name:
             return float(np.clip((v - 2.5) / 2.0, 0.0, 1.0))
@@ -259,7 +313,7 @@ class MonitoringAgent:
             return float(np.clip((v - 30.0) / 100.0, 0.0, 1.0))
         if "alp" in name or "alkaline phosphatase" in name:
             return float(np.clip((v - 40.0) / 80.0, 0.0, 1.0))
-        
+
         # Output (volume in mL)
         if (
             "urine output" in name
@@ -311,7 +365,9 @@ class MonitoringAgent:
         pressure_col = np.full((seq_len,), pressure, dtype=np.float32)
         features = np.stack([x, occ_col, pressure_col], axis=1)
 
-        return torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
+        return torch.tensor(
+            features, dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
 
     def build_hourly_sign_series_from_xt(
         self,
@@ -323,7 +379,9 @@ class MonitoringAgent:
         if step_hours <= 0:
             raise ValueError("step_hours must be positive")
 
-        windows = xt_payload.get("windows", []) if isinstance(xt_payload, Mapping) else []
+        windows = (
+            xt_payload.get("windows", []) if isinstance(xt_payload, Mapping) else []
+        )
         events = xt_payload.get("x_t", []) if isinstance(xt_payload, Mapping) else []
         if not windows:
             raise ValueError("xt_payload.windows is empty")
@@ -384,12 +442,12 @@ class MonitoringAgent:
     @staticmethod
     def _classify_vital(feature: str) -> str | None:
         """Map feature name to vital sign channel.
-        
+
         Supports 20+ clinical channels across vital signs, hemodynamics, blood gas, labs, and output.
         Returns channel name or None if unrecognized.
         """
         name = str(feature or "").strip().lower()
-        
+
         # Vital signs (CARDIO-RESPIRATORY)
         if "heart rate" in name:
             return "HR"
@@ -399,7 +457,7 @@ class MonitoringAgent:
             return "SPO2"
         if "temperature" in name:
             return "TEMP"
-        
+
         # Blood Pressure
         if "arterial blood pressure" in name:
             if "systolic" in name:
@@ -432,7 +490,7 @@ class MonitoringAgent:
         )
         if is_map_alias and not is_non_map_mean_pressure:
             return "MAP"
-        
+
         # Invasive hemodynamics
         if "central venous pressure" in name or "cvp" in name or "jvp" in name:
             return "CVP"
@@ -448,7 +506,7 @@ class MonitoringAgent:
             return "ICP"
         if "jugular venous pressure" in name:
             return "CVP"
-        
+
         # Blood gases (ABG/VBG)
         if "ph" in name and ("blood" in name or "arterial" in name or "venous" in name):
             return "pH"
@@ -456,9 +514,14 @@ class MonitoringAgent:
             return "PCO2"
         if "po2" in name or "pO2" in name or "partial pressure o2" in name:
             return "PO2"
-        if "bicarbonate" in name or "hco3" in name or "hco₃" in name or "co2 content" in name:
+        if (
+            "bicarbonate" in name
+            or "hco3" in name
+            or "hco₃" in name
+            or "co2 content" in name
+        ):
             return "HCO3"
-        
+
         # Metabolic labs
         if "glucose" in name or "blood glucose" in name or "blood sugar" in name:
             return "GLUCOSE"
@@ -481,7 +544,7 @@ class MonitoringAgent:
             return "CREATININE"
         if "bun" in name or "urea nitrogen" in name:
             return "BUN"
-        
+
         # Electrolytes
         if "potassium" in name or "k+" in name:
             return "K"
@@ -495,7 +558,7 @@ class MonitoringAgent:
             return "MG"
         if "phosphate" in name or "phosphorus" in name:
             return "PHOS"
-        
+
         # Cell counts
         if "wbc" in name or "white blood cell" in name:
             return "WBC"
@@ -505,13 +568,17 @@ class MonitoringAgent:
             return "HCT"
         if "platelet" in name or "plt" in name:
             return "PLT"
-        
+
         # Coagulation
-        if "pt" in name and "partial thromboplastin" not in name and ("inr" in name or "prothrombin" in name):
+        if (
+            "pt" in name
+            and "partial thromboplastin" not in name
+            and ("inr" in name or "prothrombin" in name)
+        ):
             return "PT"
         if "ptt" in name or "partial thromboplastin time" in name or "aptt" in name:
             return "PTT"
-        
+
         # Liver
         if "albumin" in name:
             return "ALB"
@@ -523,7 +590,7 @@ class MonitoringAgent:
             return "ALT"
         if "alp" in name or "alkaline phosphatase" in name:
             return "ALP"
-        
+
         # Output
         if (
             "urine output" in name
@@ -535,7 +602,7 @@ class MonitoringAgent:
             return "UO"
         if "drains" in name or "drain output" in name:
             return "DRAIN"
-        
+
         return None
 
     def build_hourly_vital_channels_with_mask_from_xt(
@@ -546,7 +613,7 @@ class MonitoringAgent:
         selected_channels: Sequence[str] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Resample X_t payload to fixed-step hourly time series with separate channels and missing mask.
-        
+
         Supports 40+ clinical channels across:
         - Vital signs (HR, RR, SpO2, TEMP)
         - Hemodynamics (BP, CVP, PAP, MAP, ICP)
@@ -554,7 +621,7 @@ class MonitoringAgent:
         - Metabolic (Glucose, Lactate)
         - Labs (Creatinine, BUN, Electrolytes, CBC, Liver)
         - Output (UO, Drains)
-        
+
         Returns:
             values: np.ndarray of shape (seq_len, n_channels)
             mask: np.ndarray of shape (seq_len, n_channels), observed=1.0, filled=0.0
@@ -562,7 +629,9 @@ class MonitoringAgent:
         if step_hours <= 0:
             raise ValueError("step_hours must be positive")
 
-        windows = xt_payload.get("windows", []) if isinstance(xt_payload, Mapping) else []
+        windows = (
+            xt_payload.get("windows", []) if isinstance(xt_payload, Mapping) else []
+        )
         events = xt_payload.get("x_t", []) if isinstance(xt_payload, Mapping) else []
         if not windows:
             raise ValueError("xt_payload.windows is empty")
@@ -587,7 +656,11 @@ class MonitoringAgent:
             channels = list(self.DEFAULT_CHANNELS)
         else:
             canonical = set(self.DEFAULT_CHANNELS)
-            channels = [str(ch).strip() for ch in selected_channels if str(ch).strip() in canonical]
+            channels = [
+                str(ch).strip()
+                for ch in selected_channels
+                if str(ch).strip() in canonical
+            ]
             if not channels:
                 raise ValueError("selected_channels is empty after canonical filtering")
         n_channels = len(channels)
@@ -599,7 +672,9 @@ class MonitoringAgent:
         n_steps = max(1, n_steps)
 
         # buckets[i][j] = list of values in step i for channel j
-        buckets: list[list[list[float]]] = [[[] for _ in range(n_channels)] for _ in range(n_steps)]
+        buckets: list[list[list[float]]] = [
+            [[] for _ in range(n_channels)] for _ in range(n_steps)
+        ]
 
         for row in events:
             if not isinstance(row, Mapping):
@@ -611,14 +686,14 @@ class MonitoringAgent:
             feature = str(row.get("feature") or "")
             if val is None:
                 continue
-            
+
             vital = self._classify_vital(feature)
             if vital is None:
                 continue
             if vital not in channel_to_idx:
                 continue
             ch_idx = channel_to_idx[vital]
-            
+
             try:
                 norm_v = self._normalize_sign_value(feature, float(val))
             except Exception:
@@ -632,13 +707,13 @@ class MonitoringAgent:
         # mask[i, j] indicates whether this timestep/channel had direct observations.
         series = np.zeros((n_steps, n_channels), dtype=np.float32)
         mask = np.zeros((n_steps, n_channels), dtype=np.float32)
-        
+
         # Compute fallback (global mean) for each channel
         fallbacks = np.zeros((n_channels,), dtype=np.float32)
         for ch_idx in range(n_channels):
             global_values = [x for step_data in buckets for x in step_data[ch_idx]]
             fallbacks[ch_idx] = float(np.mean(global_values)) if global_values else 0.5
-        
+
         last_values = fallbacks.copy()
         for i in range(n_steps):
             for ch_idx in range(n_channels):
@@ -646,7 +721,7 @@ class MonitoringAgent:
                     last_values[ch_idx] = float(np.mean(buckets[i][ch_idx]))
                     mask[i, ch_idx] = 1.0
                 series[i, ch_idx] = last_values[ch_idx]
-        
+
         return np.clip(series, 0.0, 1.0), mask
 
     def build_hourly_vital_channels_from_xt(
@@ -758,7 +833,9 @@ class MonitoringAgent:
     ) -> CandidateSelection:
         """Apply threshold + risk ranking + capacity-constrained top-k selection."""
         threshold = (
-            float(np.clip(risk_threshold, 0.0, 1.0)) if risk_threshold is not None else self.risk_threshold
+            float(np.clip(risk_threshold, 0.0, 1.0))
+            if risk_threshold is not None
+            else self.risk_threshold
         )
 
         if aggressiveness is None:
@@ -792,7 +869,9 @@ class MonitoringAgent:
         return CandidateSelection(
             aggressiveness=a_mon,
             risk_threshold=threshold,
-            transfer_capacity=None if transfer_capacity is None else int(max(0, transfer_capacity)),
+            transfer_capacity=(
+                None if transfer_capacity is None else int(max(0, transfer_capacity))
+            ),
             eligible_patient_ids=eligible,
             selected_patient_ids=selected,
         )
