@@ -802,7 +802,7 @@ def _compute_prauc(y_true, y_score):
     precisions = tp_cumsum / np.arange(1, len(y_sorted) + 1)
     recalls = np.concatenate([[0.0], recalls])
     precisions = np.concatenate([[1.0], precisions])
-    return float(np.trapezoid(precisions, recalls))
+    return float(np.trapz(precisions, recalls))
 
 
 def train_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None,
@@ -1494,9 +1494,9 @@ def main():
     # ── Determine embedding file ──────────────────────────────────────────────
     emb_type = EXP_CONFIG['note_embedding_type']
     if emb_type == 'clinicalbert':
-        emb_path = 'output/mimic3_note_embeddings_clinicalbert.pkl'
+        emb_path = 'output/mimic3_note_summaries_clinicalbert.pkl'
     else:
-        emb_path = 'output/mimic3_note_embeddings.pkl'
+        emb_path = 'output/mimic3_note_summaries.pkl'
     
     if not os.path.exists(emb_path):
         logging.error(f"Embeddings file not found: {emb_path}")
