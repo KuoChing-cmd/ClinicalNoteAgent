@@ -27,6 +27,7 @@ from tqdm import tqdm
 from src.data_loader import fetch_mimic3_data, flatten_features
 from src.engine import (
     _evaluate_xgb_probs,
+    _log_eval_result,
     evaluate_model,
     pretrain_transformer,
     train_model,

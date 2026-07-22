@@ -2,9 +2,12 @@ import logging
 
 import numpy as np
 import torch
+import torch.nn as nn
 from sklearn.metrics import auc, precision_recall_curve, roc_auc_score
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
+
+from src.models import TransformerPretrainer
 
 
 def _compute_prauc(y_true, y_score):

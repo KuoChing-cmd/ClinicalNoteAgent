@@ -3,6 +3,7 @@ import logging
 import duckdb
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import LabelEncoder
 
 
 def build_multihot_features(con, table, id_col, val_col, valid_ids, top_k, trim=None):
