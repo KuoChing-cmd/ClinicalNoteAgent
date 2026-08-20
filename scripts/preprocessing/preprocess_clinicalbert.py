@@ -6,8 +6,8 @@ Reads existing summaries from the Llama-generated embeddings file and produces
 new ClinicalBERT embeddings. Source data is NOT modified.
 
 Usage:
-    python preprocess_clinicalbert_embeddings.py
-    python preprocess_clinicalbert_embeddings.py --batch-size 128
+    python preprocess_clinicalbert.py
+    python preprocess_clinicalbert.py --batch-size 128
 """
 import os
 import pickle
@@ -28,7 +28,7 @@ def main(input_file, output_file, batch_size=64):
     # ── 1. Load existing summaries ────────────────────────────────────────────
     if not os.path.exists(input_file):
         logging.error(f"Source embeddings not found: {input_file}")
-        logging.error("Run preprocess_note_embeddings.py first to generate Llama summaries.")
+        logging.error("Run preprocess_notes.py first to generate Llama summaries.")
         return
 
     logging.info(f"Loading summaries from {input_file} ...")
