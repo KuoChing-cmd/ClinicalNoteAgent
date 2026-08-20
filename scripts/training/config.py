@@ -1,5 +1,7 @@
 # Edit these values to configure a run. The exp dir name is auto-generated.
 EXP_CONFIG = {
+    'num_runs': 20,
+    'seeds': [42 + i for i in range(20)],
     "epochs":      200,
     "lr":          5e-4,         # ↓ from 1e-3; smaller LR to reduce overfitting / allow longer convergence
     "batch_size":  256,
