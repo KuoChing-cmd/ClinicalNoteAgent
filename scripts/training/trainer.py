@@ -97,7 +97,7 @@ def train_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None,
             
             optimizer.zero_grad()
             logits = model(x_s, x_st, x_m, x_n)
-            loss = criterion(logits, y)
+            loss = criterion(logits.view(-1), y.view(-1))
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
@@ -127,10 +127,10 @@ def train_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None,
                     vx_n  = vbatch[4] if X_note_val  is not None else None
                     
                     vlogits = model(vx_s, vx_st, vx_m, vx_n)
-                    vloss = criterion(vlogits, vy)
+                    vloss = criterion(vlogits.view(-1), vy.view(-1))
                     val_loss_sum += vloss.item()
                     val_batches += 1
-                    all_val_preds.append(torch.sigmoid(vlogits).cpu().numpy())
+                    all_val_preds.append(torch.sigmoid(vlogits.view(-1)).cpu().numpy())
                     all_val_labels.append(vy.cpu().numpy())
             
             val_loss = val_loss_sum / max(1, val_batches)
@@ -263,7 +263,7 @@ def evaluate_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None, batch
             x_n  = batch[4] if X_note  is not None else None
             
             preds = torch.sigmoid(model(x_s, x_st, x_m, x_n))
-            all_preds.append(preds.cpu().numpy())
+            all_preds.append(preds.view(-1).cpu().numpy())
             
     y_prob = np.concatenate(all_preds)
     y_true = np.asarray(Y, dtype=np.int64)

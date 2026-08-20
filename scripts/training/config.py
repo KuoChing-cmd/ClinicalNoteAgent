@@ -14,7 +14,7 @@ EXP_CONFIG = {
     "xgb_depth":   6,
     "lgb_n_est":   200,
     "lgb_depth":   6,
-    "early_stop_patience": 30,   # ↑ from 15; give model more epochs to find better minimum
+    "early_stop_patience": 15,   # ↑ from 15; give model more epochs to find better minimum
     # Note embedding selection
     "note_embedding_type": "clinicalbert",  # "clinicalbert" (768d) or "llama" (4096d)
     # Optimizations enabled in this run
