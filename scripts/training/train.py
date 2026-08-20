@@ -359,7 +359,8 @@ def main():
         "XGBoost + LLM Notes": calc_dca(xgb_notes_probs),
         "LSTM Base": calc_dca(np.array(eval_base['y_prob'])),
         "LSTM LateFusion (+ Notes)": calc_dca(np.array(eval_notes['y_prob'])),
-        "Transformer EarlyFusion (+ Notes)": calc_dca(np.array(eval_tf['y_prob']))
+        "Transformer EarlyFusion (+ Notes)": calc_dca(np.array(eval_tf['y_prob'])),
+        "Transformer LateFusion (+ Notes)": calc_dca(np.array(eval_tf_late['y_prob']))
     }
     dca_path = os.path.join(exp_dir, 'dca_results.json')
     with open(dca_path, 'w') as f:
@@ -510,6 +511,18 @@ def main():
 {_note_row('LSTM Base', eval_base)}
 {_note_row('LSTM LateFusion (+ Notes)', eval_notes)}
 {_note_row('Transformer EarlyFusion (+ Notes)', eval_tf)}
+{_note_row('Transformer LateFusion (+ Notes)', eval_tf_late)}
+{_note_row('LSTM Base (w/o ICU)', eval_no_icu)}
+{_note_row('LSTM Base (w/o Adm)', eval_no_adm)}
+{_note_row('LSTM Base (w/o Codes)', eval_no_codes)}
+{_note_row('LSTM Base (Only Vitals)', eval_only_vitals)}
+{_note_row('LSTM Base (Only Static & Codes)', eval_only_static)}
+{_note_row('Transformer LateFusion (+ Notes)', eval_tf_late)}
+{_note_row('LSTM Base (w/o ICU)', eval_no_icu)}
+{_note_row('LSTM Base (w/o Adm)', eval_no_adm)}
+{_note_row('LSTM Base (w/o Codes)', eval_no_codes)}
+{_note_row('LSTM Base (Only Vitals)', eval_only_vitals)}
+{_note_row('LSTM Base (Only Static & Codes)', eval_only_static)}
 
 ## Ablation Study Results — Test Set @ Fixed Threshold 0.5
 | Model | Threshold | AUROC | PRAUC | Precision | Recall | F1 | Acc | Brier |
@@ -521,6 +534,18 @@ def main():
 {_note_row_05('LSTM Base', eval_base)}
 {_note_row_05('LSTM LateFusion (+ Notes)', eval_notes)}
 {_note_row_05('Transformer EarlyFusion (+ Notes)', eval_tf)}
+{_note_row_05('Transformer LateFusion (+ Notes)', eval_tf_late)}
+{_note_row_05('LSTM Base (w/o ICU)', eval_no_icu)}
+{_note_row_05('LSTM Base (w/o Adm)', eval_no_adm)}
+{_note_row_05('LSTM Base (w/o Codes)', eval_no_codes)}
+{_note_row_05('LSTM Base (Only Vitals)', eval_only_vitals)}
+{_note_row_05('LSTM Base (Only Static & Codes)', eval_only_static)}
+{_note_row_05('Transformer LateFusion (+ Notes)', eval_tf_late)}
+{_note_row_05('LSTM Base (w/o ICU)', eval_no_icu)}
+{_note_row_05('LSTM Base (w/o Adm)', eval_no_adm)}
+{_note_row_05('LSTM Base (w/o Codes)', eval_no_codes)}
+{_note_row_05('LSTM Base (Only Vitals)', eval_only_vitals)}
+{_note_row_05('LSTM Base (Only Static & Codes)', eval_only_static)}
 
 ### Note Embedding Impact (AUROC)
 - XGBoost: notes Δ AUC = {_m(eval_xgb_notes)['roc_auc'] - _m(eval_xgb_base)['roc_auc']:+.4f}
@@ -529,9 +554,9 @@ def main():
 
 
 ## Clinical Utility (Decision Curve Analysis)
-| Threshold | XGB Base | XGB + Notes | LSTM Base | LSTM + Notes | TF EarlyFusion |
-|-----------|----------|-------------|-----------|--------------|----------------|
-| 0.10 | {dca_results['XGBoost Base'][0]:.4f} | {dca_results['XGBoost + LLM Notes'][0]:.4f} | {dca_results['LSTM Base'][0]:.4f} | {dca_results['LSTM LateFusion (+ Notes)'][0]:.4f} | {dca_results['Transformer EarlyFusion (+ Notes)'][0]:.4f} |\n| 0.20 | {dca_results['XGBoost Base'][1]:.4f} | {dca_results['XGBoost + LLM Notes'][1]:.4f} | {dca_results['LSTM Base'][1]:.4f} | {dca_results['LSTM LateFusion (+ Notes)'][1]:.4f} | {dca_results['Transformer EarlyFusion (+ Notes)'][1]:.4f} |\n| 0.30 | {dca_results['XGBoost Base'][2]:.4f} | {dca_results['XGBoost + LLM Notes'][2]:.4f} | {dca_results['LSTM Base'][2]:.4f} | {dca_results['LSTM LateFusion (+ Notes)'][2]:.4f} | {dca_results['Transformer EarlyFusion (+ Notes)'][2]:.4f} |\n| 0.40 | {dca_results['XGBoost Base'][3]:.4f} | {dca_results['XGBoost + LLM Notes'][3]:.4f} | {dca_results['LSTM Base'][3]:.4f} | {dca_results['LSTM LateFusion (+ Notes)'][3]:.4f} | {dca_results['Transformer EarlyFusion (+ Notes)'][3]:.4f} |\n| 0.50 | {dca_results['XGBoost Base'][4]:.4f} | {dca_results['XGBoost + LLM Notes'][4]:.4f} | {dca_results['LSTM Base'][4]:.4f} | {dca_results['LSTM LateFusion (+ Notes)'][4]:.4f} | {dca_results['Transformer EarlyFusion (+ Notes)'][4]:.4f} |\n
+| Threshold | XGB Base | XGB + Notes | LSTM Base | LSTM + Notes | TF EarlyFusion | TF LateFusion |
+|-----------|----------|-------------|-----------|--------------|----------------|---------------|
+| 0.10 | {dca_results['XGBoost Base'][0]:.4f} | {dca_results['XGBoost + LLM Notes'][0]:.4f} | {dca_results['LSTM Base'][0]:.4f} | {dca_results['LSTM LateFusion (+ Notes)'][0]:.4f} | {dca_results['Transformer EarlyFusion (+ Notes)'][0]:.4f} | {dca_results['Transformer LateFusion (+ Notes)'][0]:.4f} |\n| 0.20 | {dca_results['XGBoost Base'][1]:.4f} | {dca_results['XGBoost + LLM Notes'][1]:.4f} | {dca_results['LSTM Base'][1]:.4f} | {dca_results['LSTM LateFusion (+ Notes)'][1]:.4f} | {dca_results['Transformer EarlyFusion (+ Notes)'][1]:.4f} | {dca_results['Transformer LateFusion (+ Notes)'][1]:.4f} |\n| 0.30 | {dca_results['XGBoost Base'][2]:.4f} | {dca_results['XGBoost + LLM Notes'][2]:.4f} | {dca_results['LSTM Base'][2]:.4f} | {dca_results['LSTM LateFusion (+ Notes)'][2]:.4f} | {dca_results['Transformer EarlyFusion (+ Notes)'][2]:.4f} | {dca_results['Transformer LateFusion (+ Notes)'][2]:.4f} |\n| 0.40 | {dca_results['XGBoost Base'][3]:.4f} | {dca_results['XGBoost + LLM Notes'][3]:.4f} | {dca_results['LSTM Base'][3]:.4f} | {dca_results['LSTM LateFusion (+ Notes)'][3]:.4f} | {dca_results['Transformer EarlyFusion (+ Notes)'][3]:.4f} | {dca_results['Transformer LateFusion (+ Notes)'][3]:.4f} |\n| 0.50 | {dca_results['XGBoost Base'][4]:.4f} | {dca_results['XGBoost + LLM Notes'][4]:.4f} | {dca_results['LSTM Base'][4]:.4f} | {dca_results['LSTM LateFusion (+ Notes)'][4]:.4f} | {dca_results['Transformer EarlyFusion (+ Notes)'][4]:.4f} | {dca_results['Transformer LateFusion (+ Notes)'][4]:.4f} |\n
 ## Sensor Dropout Robustness (LSTM LateFusion)
 | Drop Rate | Threshold | AUROC | PRAUC | Precision | Recall | F1 |
 |-----------|-----------|-------|-------|-----------|--------|----|
@@ -541,6 +566,7 @@ def main():
 | `model_lstm_base.pt`   | Base LSTM state_dict |
 | `model_lstm_notes.pt`  | Late Fusion LSTM state_dict |
 | `model_tf_notes.pt`    | Early Fusion Transformer state_dict |
+| `model_tf_late.pt`     | Late Fusion Transformer state_dict |
 | `model_xgb_base.json`  | XGBoost Base (XGBoost native format) |
 | `model_xgb_notes.json` | XGBoost + Notes (XGBoost native format) |
 | `model_lgb_base.txt`   | LightGBM Base |
