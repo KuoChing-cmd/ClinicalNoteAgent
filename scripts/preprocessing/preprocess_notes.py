@@ -9,6 +9,7 @@ import concurrent.futures
 from tqdm import tqdm
 import json
 import random
+import time
 
 OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
 MODEL_NAME = "llama3.1:latest"
@@ -40,16 +41,20 @@ def clean_text(text):
     text = re.sub(r' {3,}', ' ', text)
     return text.strip()
 
-def llm_generate(prompt, temperature=0.1, format=None):
+def llm_generate(prompt, temperature=0.1, format=None, max_retries=3):
     payload = {"model": MODEL_NAME, "prompt": prompt, "stream": False, "options": {"temperature": temperature}}
     if format:
         payload["format"] = format
-    try:
-        resp = requests.post(OLLAMA_GENERATE_URL, json=payload, timeout=120)
-        if resp.status_code == 200:
-            return resp.json().get("response", "").strip()
-    except Exception as e:
-        print(f"LLM Generate error: {e}")
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(OLLAMA_GENERATE_URL, json=payload, timeout=300)
+            if resp.status_code == 200:
+                return resp.json().get("response", "").strip()
+        except Exception as e:
+            wait_time = min(2 ** attempt * 5, 60)
+            print(f"LLM Generate error (attempt {attempt+1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+    print(f"LLM Generate failed after {max_retries} retries.")
     return ""
 
 def agent_summarize_category(category, notes_text):
@@ -326,7 +331,7 @@ def main(limit=None, evolve_limit=None):
             raw_meta, parsed_meta = agent_synthesize_meta(cat_summaries, experience_rules, case_base)
             return stay_id, cat_summaries, raw_meta, parsed_meta, mort_label, readm_label
 
-        MAX_WORKERS = 8
+        MAX_WORKERS = 4
         save_counter = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(process_task_prod, task): task for task in stay_tasks}
