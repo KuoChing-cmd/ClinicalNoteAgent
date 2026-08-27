@@ -70,17 +70,21 @@ Provide a concise, structured summary highlighting key risk factors. Do not incl
 """
     return llm_generate(prompt)
 
-def agent_synthesize_meta(category_summaries, experience_rules, case_base):
+def agent_synthesize_meta(category_summaries, rag_retriever):
     combined = ""
     for cat, summ in category_summaries.items():
         if summ:
             combined += f"\n--- {cat} Summary ---\n{summ}\n"
-            
-    rules_text = "\n".join([f"- {r}" for r in experience_rules]) if experience_rules else "None"
-    
+
+    # RAG: retrieve top-5 most relevant experience rules instead of injecting all
+    relevant_rules = rag_retriever.search_experience(combined, top_k=5)
+    rules_text = "\n".join([f"- {r}" for r in relevant_rules]) if relevant_rules else "None"
+
+    # RAG: retrieve the most similar case as few-shot example
+    similar_cases = rag_retriever.search_cases(combined, top_k=1)
     few_shot = ""
-    if case_base:
-        c = random.choice(case_base)
+    if similar_cases:
+        c = similar_cases[0]
         few_shot = f"""
 Example Similar Case:
 Domain Summaries: {json.dumps(c['category_summaries'], ensure_ascii=False)[:500]}...
@@ -198,6 +202,12 @@ def main(limit=None, evolve_limit=None):
     experience_rules = load_json_base(EXPERIENCE_BASE_PATH)
     case_base = load_json_base(CASE_BASE_PATH)
 
+    from rag_retriever import RAGRetriever
+    print("🔍 Building RAG indices for experience rules and case base...")
+    rag = RAGRetriever()
+    rag.build_experience_index(experience_rules)
+    rag.build_case_index(case_base)
+
     stay_tasks = []
     
     print("🤖 Preparing multi-agent data payload...")
@@ -257,7 +267,7 @@ def main(limit=None, evolve_limit=None):
                     
             if not cat_summaries: continue
             
-            raw_meta, parsed_meta = agent_synthesize_meta(cat_summaries, experience_rules, case_base)
+            raw_meta, parsed_meta = agent_synthesize_meta(cat_summaries, rag)
             
             mort_score = parsed_meta.get("mortality_risk_score", 5)
             readm_score = parsed_meta.get("icu_readmission_risk_score", 5)
@@ -288,16 +298,19 @@ def main(limit=None, evolve_limit=None):
                     print(f"   [New Rule Learned]: {new_rule}")
                     experience_rules.append(new_rule)
                     save_json_base(EXPERIENCE_BASE_PATH, experience_rules)
+                    rag.add_experience(new_rule)
             else:
                 print(f"✅ Prediction accurate for Stay {stay_id} on BOTH tasks. Adding to Case Base.")
-                case_base.append({
+                new_case = {
                     "stay_id": stay_id,
                     "category_summaries": cat_summaries,
                     "meta_summary": parsed_meta,
                     "mort_label": mort_label,
                     "readm_label": readm_label
-                })
+                }
+                case_base.append(new_case)
                 save_json_base(CASE_BASE_PATH, case_base)
+                rag.add_case(new_case)
                 
             summaries_dict[stay_id] = {
                 'category_summaries': cat_summaries,
@@ -328,7 +341,7 @@ def main(limit=None, evolve_limit=None):
                     
             if not cat_summaries: return stay_id, {}, "{}", {}, mort_label, readm_label
                 
-            raw_meta, parsed_meta = agent_synthesize_meta(cat_summaries, experience_rules, case_base)
+            raw_meta, parsed_meta = agent_synthesize_meta(cat_summaries, rag)
             return stay_id, cat_summaries, raw_meta, parsed_meta, mort_label, readm_label
 
         MAX_WORKERS = 4
