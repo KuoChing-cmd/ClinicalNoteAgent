@@ -39,7 +39,10 @@ def main(input_file, output_file, batch_size=64):
     tasks = []
     for stay_id, val in llama_dict.items():
         if isinstance(val, dict):
-            summary = val.get('summary', '')
+            if 'meta_summary' in val and isinstance(val['meta_summary'], dict):
+                summary = val['meta_summary'].get('final_summary', '')
+            else:
+                summary = val.get('summary', '')
         else:
             summary = ''
         # Only process if we have meaningful text

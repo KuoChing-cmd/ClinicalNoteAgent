@@ -38,6 +38,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import sys
+from pathlib import Path
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+from scripts.training.models import LSTMLateFusionWithNotes
+
 # ---------------------------------------------------------------------------
 # 日志
 # ---------------------------------------------------------------------------
@@ -841,11 +847,15 @@ def run_analysis(
     print_ablation_report(abl)
 
     # 方法 3
-    logger.info("Extracting Transformer attention weights...")
-    attn = extract_attention_weights(
-        model, x_seq, x_static, x_mh, x_note, channel_names, device
-    )
-    print_attention_report(attn)
+    attn = {}
+    if isinstance(model, TransformerEarlyFusionWithNotes):
+        logger.info("Extracting Transformer attention weights...")
+        attn = extract_attention_weights(
+            model, x_seq, x_static, x_mh, x_note, channel_names, device
+        )
+        print_attention_report(attn)
+    else:
+        logger.info("Skipping Transformer attention (model is not Transformer).")
 
     # 方法 4
     sf: dict[str, Any] = {}
