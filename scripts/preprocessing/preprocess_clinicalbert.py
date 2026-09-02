@@ -40,7 +40,26 @@ def main(input_file, output_file, batch_size=64):
     for stay_id, val in llama_dict.items():
         if isinstance(val, dict):
             if 'meta_summary' in val and isinstance(val['meta_summary'], dict):
-                summary = val['meta_summary'].get('final_summary', '')
+                meta = val['meta_summary']
+                summary_text = meta.get('final_summary', '')
+                score = meta.get('readmission_risk_score', '')
+                factors = meta.get('critical_factors_list', [])
+                
+                parts = []
+                if score != '' and score is not None:
+                    parts.append(f"Risk Score: {score}")
+                
+                if factors:
+                    if isinstance(factors, list):
+                        factors_str = "; ".join(str(f) for f in factors)
+                    else:
+                        factors_str = str(factors)
+                    parts.append(f"Critical Factors: {factors_str}")
+                    
+                if summary_text:
+                    parts.append(f"Summary: {summary_text}")
+                
+                summary = " | ".join(parts)
             else:
                 summary = val.get('summary', '')
         else:
