@@ -269,10 +269,35 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     
     # Add ICU LOS pressure features (uses ICUSTAYS.LOS column, no cross-patient timestamp comparison)
     stays_df = compute_icu_load_features(stays_df)
+
+    hadm_ids_tuple = tuple(stays_df['HADM_ID'].unique().tolist())
+
+    # Load primary DRG per admission as a single categorical feature for nn.Embedding
+    logging.info("Loading primary DRG code per admission...")
+    drg_df = con.query(f"""
+        SELECT HADM_ID, CAST(DRG_CODE AS VARCHAR) as drg_code
+        FROM read_csv_auto('/home/hanwen/data/mimic/iii/DRGCODES.csv', sample_size=-1)
+        WHERE HADM_ID IN {hadm_ids_tuple} AND DRG_CODE IS NOT NULL
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY HADM_ID 
+            ORDER BY CASE WHEN DRG_TYPE = 'HCFA' THEN 1 WHEN DRG_TYPE = 'MS' THEN 2 ELSE 3 END, ROW_ID
+        ) = 1
+    """).df()
+    stays_df = stays_df.merge(drg_df, on='HADM_ID', how='left')
+    stays_df['drg_code'] = stays_df['drg_code'].fillna('UNKNOWN').astype(str)
+    top_drg_set = set(
+        stays_df[stays_df['drg_code'] != 'UNKNOWN']['drg_code']
+        .value_counts()
+        .nlargest(128)
+        .index
+    )
+    stays_df['drg_code'] = stays_df['drg_code'].apply(
+        lambda x: x if (x == 'UNKNOWN' or x in top_drg_set) else 'OTHER'
+    )
     
     cont_cols = ['age', 'pre_icu_transfers', 'surg_count', 'log_surg_gap', 'log_ed_wait',
                  'icu_speedup_los', 'log_icu_los']
-    cat_cols = ['GENDER', 'MARITAL_STATUS', 'ETHNICITY', 'INSURANCE', 'ADMISSION_TYPE', 'ADMISSION_LOCATION', 'FIRST_CAREUNIT', 'surg_flag']
+    cat_cols = ['GENDER', 'MARITAL_STATUS', 'ETHNICITY', 'INSURANCE', 'ADMISSION_TYPE', 'ADMISSION_LOCATION', 'FIRST_CAREUNIT', 'surg_flag', 'drg_code']
     
     static_encoders, static_dims = {}, {}
     for col in cont_cols:
@@ -284,14 +309,9 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
         static_encoders[col] = le
         static_dims[col] = len(le.classes_)
 
-    hadm_ids_tuple = tuple(stays_df['HADM_ID'].unique().tolist())
-
-    # 2. Extract High-Dim Sparse Features
+    # 2. Extract High-Dim Sparse Features (Multi-hot without DRG)
     logging.info("Loading ICD Diagnoses (Top 64)...")
     icd_dict, icd_dim = build_multihot_features(con, 'DIAGNOSES_ICD', 'HADM_ID', 'ICD9_CODE', hadm_ids_tuple, top_k=64, trim=3)
-    
-    logging.info("Loading DRG Codes (Top 64)...")
-    drg_dict, drg_dim = build_multihot_features(con, 'DRGCODES', 'HADM_ID', 'DRG_CODE', hadm_ids_tuple, top_k=64)
     
     logging.info("Loading Procedures ICD (Top 64)...")
     proc_dict, proc_dim = build_multihot_features(con, 'PROCEDURES_ICD', 'HADM_ID', 'ICD9_CODE', hadm_ids_tuple, top_k=64, trim=3)
@@ -299,7 +319,7 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     logging.info("Loading Pharmacy / Prescriptions (Top 64)...")
     rx_dict, rx_dim = build_multihot_features(con, 'PRESCRIPTIONS', 'HADM_ID', 'DRUG', hadm_ids_tuple, top_k=64)
     
-    multihot_dims = {'icd': icd_dim, 'drg': drg_dim, 'proc': proc_dim, 'rx': rx_dim}
+    multihot_dims = {'icd': icd_dim, 'proc': proc_dim, 'rx': rx_dim}
 
     # 3. Dynamic Sequence Features (Vital Signs)
     # Includes both invasive (Arterial Line) and non-invasive (NIBP) blood pressure.
@@ -349,7 +369,6 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
         
         mh_vecs = []
         mh_vecs.append(icd_dict.get(hadm, np.zeros(icd_dim, dtype=np.float32)))
-        mh_vecs.append(drg_dict.get(hadm, np.zeros(drg_dim, dtype=np.float32)))
         mh_vecs.append(proc_dict.get(hadm, np.zeros(proc_dim, dtype=np.float32)))
         mh_vecs.append(rx_dict.get(hadm, np.zeros(rx_dim, dtype=np.float32)))
         X_mh.append(np.concatenate(mh_vecs))

@@ -106,8 +106,8 @@ def main():
     # ── Dataset cache: skip 17-min DuckDB pipeline on repeat runs ─────────────
     # Cache is per embedding type to avoid conflicts
     cache_tag = f'_{emb_type}' if emb_type != 'llama' else ''
-    cache_npz  = f'output/dataset_cache{cache_tag}_8dim_icuload_nibp.npz'
-    cache_meta = f'output/dataset_cache{cache_tag}_meta_8dim_icuload_nibp.pkl'
+    cache_npz  = f'output/dataset_cache{cache_tag}_8dim_icuload_nibp_drgemb.npz'
+    cache_meta = f'output/dataset_cache{cache_tag}_meta_8dim_icuload_nibp_drgemb.pkl'
     
     if os.path.exists(cache_npz) and os.path.exists(cache_meta):
         logging.info(f"Loading cached dataset from {cache_npz} ...")
