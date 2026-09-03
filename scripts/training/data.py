@@ -301,12 +301,16 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     
     multihot_dims = {'icd': icd_dim, 'drg': drg_dim, 'proc': proc_dim, 'rx': rx_dim}
 
-    # 3. Dynamic Sequence Features
+    # 3. Dynamic Sequence Features (Vital Signs)
+    # Includes both invasive (Arterial Line) and non-invasive (NIBP) blood pressure.
     item_map = {
-        211: 0, 220045: 0, 618: 1, 220210: 1, 646: 2, 220277: 2, 51: 3, 220050: 3,
-        8368: 4, 220051: 4,               # Diastolic BP
-        52: 5, 220052: 5, 225312: 5,      # MAP
-        678: 6, 223761: 6, 676: 6, 223762: 6, # Temperature
+        211: 0, 220045: 0,                           # HR
+        618: 1, 220210: 1,                           # RR
+        646: 2, 220277: 2,                           # SpO2
+        51: 3, 220050: 3, 455: 3, 220179: 3,        # SBP (Arterial: 51, 220050; NIBP: 455, 220179)
+        8368: 4, 220051: 4, 8441: 4, 220180: 4,     # DBP (Arterial: 8368, 220051; NIBP: 8441, 220180)
+        52: 5, 220052: 5, 225312: 5, 456: 5, 220181: 5, # MAP (Arterial: 52, 220052, 225312; NIBP: 456, 220181)
+        678: 6, 223761: 6, 676: 6, 223762: 6,       # Temperature
         807: 7, 811: 7, 1529: 7, 225664: 7, 220621: 7 # Glucose
     }
     logging.info(f"Querying CHARTEVENTS for sequences...")
@@ -331,6 +335,10 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
             evs['CHARTTIME'] = pd.to_datetime(evs['CHARTTIME'])
             evs['hour'] = ((evs['CHARTTIME'] - stay['INTIME']).dt.total_seconds() / 3600).astype(int)
             evs = evs[(evs['hour'] >= 0) & (evs['hour'] < 48)]
+            # Prioritize invasive arterial line over cuff NIBP if measured within the same hour
+            invasive_ids = {51, 8368, 52, 220050, 220051, 220052, 225312}
+            evs['is_invasive'] = evs['ITEMID'].isin(invasive_ids).astype(int)
+            evs = evs.sort_values(['hour', 'is_invasive', 'CHARTTIME'])
             for _, e in evs.iterrows():
                 seq[int(e['hour']), item_map[e['ITEMID']]] = e['VALUENUM']
 
