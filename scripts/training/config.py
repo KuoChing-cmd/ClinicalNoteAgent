@@ -24,5 +24,10 @@ EXP_CONFIG = {
     "opt_cosine_lr":   True,     # ② CosineAnnealingLR scheduler
     "opt_pos_weight":  True,     # ③ pos_weight for class imbalance
     "static_mode":     "multi_token", # 开启细粒度多 Token 模式
+    # End-to-End ClinicalBERT fine-tuning
+    "e2e_bert_model":    "emilyalsentzer/Bio_ClinicalBERT",
+    "e2e_bert_lr_scale": 0.1,       # BERT LR = lr * 0.1 (prevent catastrophic forgetting)
+    "e2e_max_seq_len":   512,       # tokenizer max_length
+    "e2e_batch_size":    64,        # E2E dedicated batch size
 }
 

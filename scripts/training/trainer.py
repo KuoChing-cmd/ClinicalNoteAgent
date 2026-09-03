@@ -2,6 +2,7 @@ import os
 import pickle
 import logging
 from datetime import datetime
+from collections.abc import Mapping
 import json
 import numpy as np
 import pandas as pd
@@ -17,6 +18,54 @@ import lightgbm as lgb
 import math
 
 from metrics import _compute_prauc, _search_best_threshold_f1, _compute_classification_metrics
+
+
+class NoteTextDataset(torch.utils.data.Dataset):
+    def __init__(self, X_seq, Y, X_static=None, X_mh=None, note_texts=None, tokenizer=None, max_seq_len=512):
+        self.X_seq = np.asarray(X_seq, dtype=np.float32)
+        self.Y = np.asarray(Y, dtype=np.float32)
+        self.X_static = np.asarray(X_static, dtype=np.float32) if X_static is not None else None
+        self.X_mh = np.asarray(X_mh, dtype=np.float32) if X_mh is not None else None
+        self.note_texts = list(note_texts) if note_texts is not None else [''] * len(self.X_seq)
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
+
+    def __len__(self):
+        return len(self.X_seq)
+
+    def __getitem__(self, idx):
+        return (
+            self.X_seq[idx],
+            self.Y[idx],
+            self.X_static[idx] if self.X_static is not None else None,
+            self.X_mh[idx] if self.X_mh is not None else None,
+            self.note_texts[idx],
+        )
+
+    @staticmethod
+    def collate_fn(batch, tokenizer, max_seq_len=512):
+        seqs = torch.tensor([item[0] for item in batch], dtype=torch.float32)
+        ys = torch.tensor([item[1] for item in batch], dtype=torch.float32)
+
+        static = [item[2] for item in batch]
+        if static and static[0] is not None:
+            static = torch.tensor(static, dtype=torch.float32)
+        else:
+            static = None
+
+        mh = [item[3] for item in batch]
+        if mh and mh[0] is not None:
+            mh = torch.tensor(mh, dtype=torch.float32)
+        else:
+            mh = None
+
+        texts = [item[4] for item in batch]
+        if tokenizer is not None:
+            encoded = tokenizer(texts, padding=True, truncation=True, max_length=max_seq_len, return_tensors='pt')
+        else:
+            encoded = {'input_ids': torch.zeros((len(texts), 1), dtype=torch.long), 'attention_mask': torch.ones((len(texts), 1), dtype=torch.long)}
+
+        return seqs, ys, static, mh, encoded
 
 def train_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None,
                 X_seq_val=None, Y_val=None, X_static_val=None, X_mh_val=None, X_note_val=None,
@@ -230,7 +279,122 @@ def pretrain_transformer(encoder, X_seq, seq_dim, hidden_dim, epochs=10, lr=1e-3
     logging.info("Pretraining completed.")
     return encoder
 
-def evaluate_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None, batch_size=512):
+def train_e2e_model(model, X_seq, Y, X_static=None, X_mh=None, X_note_texts=None,
+                   X_seq_val=None, Y_val=None, X_static_val=None, X_mh_val=None,
+                   X_note_texts_val=None, epochs=12, lr=1e-3, batch_size=32,
+                   pos_weight=None, early_stop_patience=30, early_stop_min_delta=1e-4,
+                   max_seq_len=512):
+    """Train an end-to-end note model that tokenizes strings on the fly."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    tokenizer = getattr(model, 'tokenizer', None)
+    if tokenizer is None:
+        raise ValueError('E2E model must expose a tokenizer for note tokenization.')
+
+    train_dataset = NoteTextDataset(X_seq, Y, X_static, X_mh, X_note_texts, tokenizer, max_seq_len=max_seq_len)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda batch: NoteTextDataset.collate_fn(batch, tokenizer, max_seq_len))
+
+    has_val = X_seq_val is not None and Y_val is not None
+    val_loader = None
+    if has_val:
+        val_dataset = NoteTextDataset(X_seq_val, Y_val, X_static_val, X_mh_val, X_note_texts_val, tokenizer, max_seq_len=max_seq_len)
+        val_loader = DataLoader(val_dataset, batch_size=max(1, batch_size * 2), shuffle=False, collate_fn=lambda batch: NoteTextDataset.collate_fn(batch, tokenizer, max_seq_len))
+
+    pw = torch.tensor([pos_weight], dtype=torch.float32).to(device) if pos_weight is not None else None
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
+    bert_params = []
+    non_bert_params = []
+    for name, param in model.named_parameters():
+        if 'bert' in name.lower():
+            bert_params.append(param)
+        else:
+            non_bert_params.append(param)
+    optimizer = torch.optim.Adam([
+        {'params': non_bert_params, 'lr': lr},
+        {'params': bert_params, 'lr': lr * getattr(model, 'bert_lr_scale', 0.1)},
+    ])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
+
+    epoch_history = []
+    best_val_loss = float('inf')
+    best_epoch = 0
+    epochs_without_improve = 0
+    best_state = None
+
+    for epoch in range(epochs):
+        model.train()
+        epoch_loss = 0.0
+        for x_seq_batch, y_batch, x_static_batch, x_mh_batch, encoded in train_loader:
+            x_seq_batch = x_seq_batch.to(device)
+            y_batch = y_batch.to(device)
+            x_static_batch = x_static_batch.to(device) if x_static_batch is not None else None
+            x_mh_batch = x_mh_batch.to(device) if x_mh_batch is not None else None
+            if isinstance(encoded, Mapping):
+                encoded = {k: v.to(device) for k, v in encoded.items()}
+            optimizer.zero_grad()
+            logits = model(x_seq_batch, x_static_batch, x_mh_batch, x_note_tokens=encoded)
+            loss = criterion(logits.view(-1), y_batch.view(-1))
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+
+        scheduler.step()
+        train_loss = epoch_loss / max(1, len(train_loader))
+        current_lr = scheduler.get_last_lr()[0]
+        row = {'epoch': epoch + 1, 'train_loss': round(train_loss, 6), 'lr': float(f'{current_lr:.2e}')}
+
+        if has_val:
+            model.eval()
+            val_loss_sum = 0.0
+            all_val_preds = []
+            all_val_labels = []
+            with torch.no_grad():
+                for x_seq_batch, y_batch, x_static_batch, x_mh_batch, encoded in val_loader:
+                    x_seq_batch = x_seq_batch.to(device)
+                    y_batch = y_batch.to(device)
+                    x_static_batch = x_static_batch.to(device) if x_static_batch is not None else None
+                    x_mh_batch = x_mh_batch.to(device) if x_mh_batch is not None else None
+                    if isinstance(encoded, Mapping):
+                        encoded = {k: v.to(device) for k, v in encoded.items()}
+                    logits = model(x_seq_batch, x_static_batch, x_mh_batch, x_note_tokens=encoded)
+                    vloss = criterion(logits.view(-1), y_batch.view(-1))
+                    val_loss_sum += vloss.item()
+                    all_val_preds.append(torch.sigmoid(logits.view(-1)).cpu().numpy())
+                    all_val_labels.append(y_batch.cpu().numpy())
+
+            val_loss = val_loss_sum / max(1, len(val_loader))
+            val_preds = np.concatenate(all_val_preds)
+            val_labels = np.concatenate(all_val_labels)
+            val_auroc = roc_auc_score(val_labels, val_preds)
+            val_prauc = _compute_prauc(val_labels, val_preds)
+            row['val_loss'] = round(val_loss, 6)
+            row['val_auroc'] = round(val_auroc, 4)
+            row['val_prauc'] = round(val_prauc, 4)
+
+            if val_loss < (best_val_loss - early_stop_min_delta):
+                best_val_loss = val_loss
+                best_epoch = epoch + 1
+                epochs_without_improve = 0
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            else:
+                epochs_without_improve += 1
+            row['best_val_loss'] = round(best_val_loss, 6)
+            row['patience_counter'] = epochs_without_improve
+
+            if epochs_without_improve >= early_stop_patience:
+                logging.info(f'⚡ Early stopping triggered at epoch {epoch + 1}. Best val_loss={best_val_loss:.6f} at epoch {best_epoch}.')
+                row['early_stopped'] = True
+                epoch_history.append(row)
+                break
+
+        epoch_history.append(row)
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, epoch_history
+
+
+def evaluate_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None, X_note_texts=None, batch_size=512, tokenizer=None):
     """
     Evaluate a PyTorch model. Returns a dict containing:
       - y_prob: raw predicted probabilities
@@ -241,28 +405,38 @@ def evaluate_model(model, X_seq, Y, X_static=None, X_mh=None, X_note=None, batch
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.eval()
     
-    tensors = [torch.tensor(X_seq, dtype=torch.float32).to(device), torch.tensor(Y, dtype=torch.float32).to(device)]
-    
-    if X_static is not None: tensors.append(torch.tensor(X_static, dtype=torch.float32).to(device))
-    else: tensors.append(torch.zeros(len(Y), 1).to(device))
-        
-    if X_mh is not None: tensors.append(torch.tensor(X_mh, dtype=torch.float32).to(device))
-    else: tensors.append(torch.zeros(len(Y), 1).to(device))
+    if X_note_texts is not None and tokenizer is None:
+        tokenizer = getattr(model, 'tokenizer', None)
+    if X_note_texts is not None and tokenizer is not None:
+        dataset = NoteTextDataset(X_seq, Y, X_static, X_mh, X_note_texts, tokenizer, max_seq_len=getattr(model, 'max_seq_len', 512))
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda batch: NoteTextDataset.collate_fn(batch, tokenizer, getattr(model, 'max_seq_len', 512)))
+    else:
+        tensors = [torch.tensor(X_seq, dtype=torch.float32).to(device), torch.tensor(Y, dtype=torch.float32).to(device)]
+        if X_static is not None: tensors.append(torch.tensor(X_static, dtype=torch.float32).to(device))
+        else: tensors.append(torch.zeros(len(Y), 1).to(device))
+        if X_mh is not None: tensors.append(torch.tensor(X_mh, dtype=torch.float32).to(device))
+        else: tensors.append(torch.zeros(len(Y), 1).to(device))
+        if X_note is not None: tensors.append(torch.tensor(X_note, dtype=torch.float32).to(device))
+        dataset = TensorDataset(*tensors)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
-    if X_note is not None: tensors.append(torch.tensor(X_note, dtype=torch.float32).to(device))
-        
-    dataset = TensorDataset(*tensors)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    
     all_preds = []
     with torch.no_grad():
         for batch in loader:
-            x_s = batch[0]
-            x_st = batch[2] if X_static is not None else None
-            x_m  = batch[3] if X_mh    is not None else None
-            x_n  = batch[4] if X_note  is not None else None
-            
-            preds = torch.sigmoid(model(x_s, x_st, x_m, x_n))
+            if X_note_texts is not None and tokenizer is not None:
+                x_s, y_dummy, x_st, x_m, encoded = batch
+                x_s = x_s.to(device)
+                x_st = x_st.to(device) if x_st is not None else None
+                x_m = x_m.to(device) if x_m is not None else None
+                if isinstance(encoded, Mapping):
+                    encoded = {k: v.to(device) for k, v in encoded.items()}
+                preds = torch.sigmoid(model(x_s, x_st, x_m, x_note_tokens=encoded))
+            else:
+                x_s = batch[0]
+                x_st = batch[2] if X_static is not None else None
+                x_m  = batch[3] if X_mh    is not None else None
+                x_n  = batch[4] if X_note  is not None else None
+                preds = torch.sigmoid(model(x_s, x_st, x_m, x_n))
             all_preds.append(preds.view(-1).cpu().numpy())
             
     y_prob = np.concatenate(all_preds)

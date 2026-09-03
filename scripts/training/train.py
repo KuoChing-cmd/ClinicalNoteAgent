@@ -1,5 +1,6 @@
 import os
 import math
+from typing import cast
 
 # Automatically set NUMEXPR_MAX_THREADS based on estimated idle CPU cores
 try:
@@ -24,24 +25,35 @@ logging.basicConfig(
 )
 import json
 import numpy as np
-import pandas as pd
-import duckdb
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.metrics import roc_auc_score
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from tqdm import tqdm
+from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
 import lightgbm as lgb
-import math
 
 
 from config import EXP_CONFIG
-from models import LSTMLateFusionWithNotes, TransformerLateFusionWithNotes, TransformerEarlyFusionWithNotes
-from data import build_multihot_features, enrich_stays_with_features, compute_icu_load_features, fetch_mimic3_data, flatten_features
-from metrics import _search_best_threshold_f1, _compute_classification_metrics, _evaluate_xgb_probs, _log_eval_result, make_exp_dir
-from trainer import train_model, pretrain_transformer, evaluate_model
+from models import LSTMLateFusionWithNotes, TransformerLateFusionWithNotes, TransformerEarlyFusionWithNotes, LSTMEndToEndWithNotes, TransformerEndToEndWithNotes
+from data import fetch_mimic3_data, flatten_features, load_note_texts
+from metrics import _evaluate_xgb_probs, _log_eval_result, make_exp_dir
+from trainer import train_model, train_e2e_model, evaluate_model
+
+
+def _build_note_texts_from_summary_map(note_texts_map, sample_count):
+    if sample_count <= 0:
+        return []
+    texts = [""] * sample_count
+    for i in range(sample_count):
+        texts[i] = str(note_texts_map.get(i, ""))
+    return texts
+
+
+def _positive_class_probs(proba):
+    if hasattr(proba, 'toarray'):
+        proba = proba.toarray()
+    arr = np.asarray(proba)
+    if arr.ndim == 1:
+        return arr.astype(np.float64)
+    return arr[:, 1].astype(np.float64)
 
 def main():
     # ── Determine embedding file ──────────────────────────────────────────────
@@ -51,6 +63,7 @@ def main():
     else:
         emb_path = 'output/mimic3_note_embeddings.pkl'
     
+    note_summary_path = 'output/mimic3_note_summaries.pkl'
     if not os.path.exists(emb_path):
         logging.error(f"Embeddings file not found: {emb_path}")
         if emb_type == 'clinicalbert':
@@ -58,6 +71,15 @@ def main():
         else:
             logging.error("Run preprocess_note_embeddings.py first.")
         return
+
+    if os.path.exists(note_summary_path):
+        with open(note_summary_path, 'rb') as f:
+            note_summary_dict = pickle.load(f)
+        note_texts_map = load_note_texts(note_summary_dict)
+        logging.info(f"Loaded note text cache from {note_summary_path} ({len(note_texts_map)} stays)")
+    else:
+        note_texts_map = {}
+        logging.warning(f"Note summary file not found: {note_summary_path}; E2E models will use empty text for missing samples.")
     
     # Create the experiment directory for this run
     exp_dir = make_exp_dir()
@@ -101,6 +123,7 @@ def main():
             meta = pickle.load(f)
         static_dims   = meta['static_dims']
         multihot_dims = meta['multihot_dims']
+        X_note_texts = _build_note_texts_from_summary_map(note_texts_map, len(Y))
         logging.info(
             f"Cache loaded: {len(Y)} samples, "
             f"X_seq={X_seq.shape}, X_note={X_note.shape} "
@@ -108,10 +131,12 @@ def main():
         )
     else:
         logging.info("No dataset cache found — running full DuckDB pipeline...")
-        X_seq, X_static, X_mh, X_note, Y, static_dims, multihot_dims = fetch_mimic3_data(
+        fetched = fetch_mimic3_data(
             embeddings_dict, note_emb_dim=note_dim_detected
         )
-        if X_seq is None: return
+        if fetched[0] is None:
+            return
+        X_seq, X_static, X_mh, X_note, Y, static_dims, multihot_dims, X_note_texts = cast(tuple, fetched)
         # Save cache for future runs
         np.savez_compressed(
             cache_npz,
@@ -120,6 +145,21 @@ def main():
         with open(cache_meta, 'wb') as f:
             pickle.dump({'static_dims': static_dims, 'multihot_dims': multihot_dims}, f)
         logging.info(f"Dataset cached to {cache_npz} + {cache_meta}")
+
+    if X_seq is None or X_static is None or X_mh is None or X_note is None or Y is None:
+        logging.error("Dataset build/load returned incomplete arrays; aborting run.")
+        return
+    if static_dims is None or multihot_dims is None:
+        logging.error("Dataset metadata is missing; aborting run.")
+        return
+
+    X_seq = cast(np.ndarray, X_seq)
+    X_static = cast(np.ndarray, X_static)
+    X_mh = cast(np.ndarray, X_mh)
+    X_note = cast(np.ndarray, X_note)
+    Y = cast(np.ndarray, Y)
+    static_dims = cast(dict, static_dims)
+    multihot_dims = cast(dict, multihot_dims)
     
     ordered_static_dims = static_dims
                            
@@ -128,6 +168,7 @@ def main():
     multi_run_results = {}
     all_dca_results = []
     all_robustness_results = []
+    pos_weight_val = 1.0
     for run_idx, seed in enumerate(seeds[:num_runs]):
         logging.info(f'\n' + '='*60)
         logging.info(f'STARTING RUN {run_idx+1}/{num_runs} WITH SEED {seed}')
@@ -146,7 +187,7 @@ def main():
         # Fit StandardScaler ONLY on train split to prevent data leakage.
         # Reshape (N, T, F) -> (N*T, F) for fitting, then reshape back.
         logging.info("Applying StandardScaler to sequence features (fit on train only)...")
-        N_train, T, F = X_seq[train_idx].shape
+        _, T, F = X_seq[train_idx].shape
         seq_scaler = StandardScaler()
         X_seq_train_flat = X_seq[train_idx].reshape(-1, F)
         seq_scaler.fit(X_seq_train_flat)
@@ -278,6 +319,63 @@ def main():
         eval_only_static = evaluate_model(model_only_static, X_seq_zero[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx])
         _log_eval_result('LSTM Base (Only Static & Codes)', eval_only_static)
 
+        logging.info('10. Training LSTM E2E FineTune (Base + ClinicalBERT Online)...')
+        model_lstm_e2e = LSTMEndToEndWithNotes(
+            seq_dim=8,
+            static_dims=ordered_static_dims,
+            multihot_dims=multihot_dims,
+            hidden_dim=EXP_CONFIG['hidden_dim'],
+            note_dim=EXP_CONFIG['note_dim'],
+            num_layers=EXP_CONFIG['num_layers'],
+            dropout=EXP_CONFIG['dropout'],
+            bert_model_name=EXP_CONFIG['e2e_bert_model'],
+            freeze_layers=EXP_CONFIG.get('e2e_freeze_layers', 8),
+            bert_lr_scale=EXP_CONFIG.get('e2e_bert_lr_scale', 0.1),
+        )
+        model_lstm_e2e, hist_lstm_e2e = train_e2e_model(
+            model_lstm_e2e,
+            X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx],
+            [X_note_texts[i] for i in train_idx],
+            X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx],
+            X_note_texts_val=[X_note_texts[i] for i in val_idx],
+            epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG.get('e2e_batch_size', 32),
+            early_stop_patience=EXP_CONFIG['early_stop_patience'], pos_weight=pos_weight_val,
+            max_seq_len=EXP_CONFIG.get('e2e_max_seq_len', 512),
+        )
+        all_epoch_histories['lstm_e2e_notes'] = hist_lstm_e2e
+        eval_lstm_e2e = evaluate_model(model_lstm_e2e, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note_texts=[X_note_texts[i] for i in test_idx], batch_size=EXP_CONFIG.get('e2e_batch_size', 32), tokenizer=model_lstm_e2e.tokenizer)
+        _log_eval_result('LSTM E2E FineTune (+ Notes)', eval_lstm_e2e)
+        torch.save(model_lstm_e2e.state_dict(), os.path.join(exp_dir, 'model_lstm_e2e.pt'))
+
+        logging.info('11. Training Transformer E2E FineTune (Base + ClinicalBERT Online)...')
+        model_tf_e2e = TransformerEndToEndWithNotes(
+            seq_dim=8,
+            static_dims=ordered_static_dims,
+            multihot_dims=multihot_dims,
+            hidden_dim=EXP_CONFIG['hidden_dim'],
+            note_dim=EXP_CONFIG['note_dim'],
+            num_layers=EXP_CONFIG['tf_num_layers'],
+            nhead=EXP_CONFIG['tf_nhead'],
+            dropout=EXP_CONFIG['dropout'],
+            bert_model_name=EXP_CONFIG['e2e_bert_model'],
+            freeze_layers=EXP_CONFIG.get('e2e_freeze_layers', 8),
+            bert_lr_scale=EXP_CONFIG.get('e2e_bert_lr_scale', 0.1),
+        )
+        model_tf_e2e, hist_tf_e2e = train_e2e_model(
+            model_tf_e2e,
+            X_seq[train_idx], Y[train_idx], X_static[train_idx], X_mh[train_idx],
+            [X_note_texts[i] for i in train_idx],
+            X_seq_val=X_seq[val_idx], Y_val=Y[val_idx], X_static_val=X_static[val_idx], X_mh_val=X_mh[val_idx],
+            X_note_texts_val=[X_note_texts[i] for i in val_idx],
+            epochs=EXP_CONFIG['epochs'], lr=EXP_CONFIG['lr'], batch_size=EXP_CONFIG.get('e2e_batch_size', 32),
+            early_stop_patience=EXP_CONFIG['early_stop_patience'], pos_weight=pos_weight_val,
+            max_seq_len=EXP_CONFIG.get('e2e_max_seq_len', 512),
+        )
+        all_epoch_histories['transformer_e2e_notes'] = hist_tf_e2e
+        eval_tf_e2e = evaluate_model(model_tf_e2e, X_seq[test_idx], Y[test_idx], X_static[test_idx], X_mh[test_idx], X_note_texts=[X_note_texts[i] for i in test_idx], batch_size=EXP_CONFIG.get('e2e_batch_size', 32), tokenizer=model_tf_e2e.tokenizer)
+        _log_eval_result('Transformer E2E FineTune (+ Notes)', eval_tf_e2e)
+        torch.save(model_tf_e2e.state_dict(), os.path.join(exp_dir, 'model_tf_e2e.pt'))
+
     
         # XGBoost natively handles class imbalance via scale_pos_weight (equivalent to pos_weight)
         X_xgb_base = flatten_features(X_seq, X_static, X_mh)
@@ -285,7 +383,7 @@ def main():
                                        scale_pos_weight=pos_weight_val,
                                        tree_method='hist', device='cuda')
         xgb_base.fit(X_xgb_base[train_idx], Y[train_idx])
-        xgb_base_probs = xgb_base.predict_proba(X_xgb_base[test_idx])[:, 1]
+        xgb_base_probs = _positive_class_probs(xgb_base.predict_proba(X_xgb_base[test_idx]))
         eval_xgb_base = _evaluate_xgb_probs(Y[test_idx], xgb_base_probs)
         _log_eval_result('XGBoost Base', eval_xgb_base)
         xgb_base.save_model(os.path.join(exp_dir, 'model_xgb_base.json'))
@@ -296,7 +394,7 @@ def main():
                                         scale_pos_weight=pos_weight_val,
                                         tree_method='hist', device='cuda')
         xgb_notes.fit(X_xgb_notes[train_idx], Y[train_idx])
-        xgb_notes_probs = xgb_notes.predict_proba(X_xgb_notes[test_idx])[:, 1]
+        xgb_notes_probs = _positive_class_probs(xgb_notes.predict_proba(X_xgb_notes[test_idx]))
         eval_xgb_notes = _evaluate_xgb_probs(Y[test_idx], xgb_notes_probs)
         _log_eval_result('XGBoost + Notes', eval_xgb_notes)
         xgb_notes.save_model(os.path.join(exp_dir, 'model_xgb_notes.json'))
@@ -307,7 +405,7 @@ def main():
         num_seq_cols = X_seq.shape[2] * 2
         cat_indices = []
         current_idx = num_seq_cols
-        for col, dim in ordered_static_dims.items():
+        for _, dim in ordered_static_dims.items():
             if dim > 0:  # dim > 0 indicates it's a categorical feature
                 cat_indices.append(current_idx)
             current_idx += 1
@@ -317,7 +415,7 @@ def main():
                                       scale_pos_weight=pos_weight_val,
                                       n_jobs=-1, verbose=-1)
         lgb_base.fit(X_xgb_base[train_idx], Y[train_idx], categorical_feature=cat_indices)
-        lgb_base_probs = lgb_base.predict_proba(X_xgb_base[test_idx])[:, 1]
+        lgb_base_probs = _positive_class_probs(lgb_base.predict_proba(X_xgb_base[test_idx]))
         eval_lgb_base = _evaluate_xgb_probs(Y[test_idx], lgb_base_probs)
         _log_eval_result('LightGBM Base', eval_lgb_base)
         lgb_base.booster_.save_model(os.path.join(exp_dir, 'model_lgb_base.txt'))
@@ -327,7 +425,7 @@ def main():
                                        scale_pos_weight=pos_weight_val,
                                        n_jobs=-1, verbose=-1)
         lgb_notes.fit(X_xgb_notes[train_idx], Y[train_idx], categorical_feature=cat_indices)
-        lgb_notes_probs = lgb_notes.predict_proba(X_xgb_notes[test_idx])[:, 1]
+        lgb_notes_probs = _positive_class_probs(lgb_notes.predict_proba(X_xgb_notes[test_idx]))
         eval_lgb_notes = _evaluate_xgb_probs(Y[test_idx], lgb_notes_probs)
         _log_eval_result('LightGBM + Notes', eval_lgb_notes)
         lgb_notes.booster_.save_model(os.path.join(exp_dir, 'model_lgb_notes.txt'))
@@ -338,6 +436,9 @@ def main():
             'lstm_base': eval_base,
             'lstm_latefusion_notes': eval_notes,
             'transformer_earlyfusion_notes': eval_tf,
+            'transformer_latefusion_notes': eval_tf_late,
+            'lstm_e2e_notes': eval_lstm_e2e,
+            'transformer_e2e_notes': eval_tf_e2e,
             'xgb_base': eval_xgb_base,
             'xgb_notes': eval_xgb_notes,
             'lgb_base': eval_lgb_base,
@@ -369,7 +470,9 @@ def main():
             "LSTM Base": calc_dca(np.array(eval_base['y_prob'])),
             "LSTM LateFusion (+ Notes)": calc_dca(np.array(eval_notes['y_prob'])),
             "Transformer EarlyFusion (+ Notes)": calc_dca(np.array(eval_tf['y_prob'])),
-            "Transformer LateFusion (+ Notes)": calc_dca(np.array(eval_tf_late['y_prob']))
+            "Transformer LateFusion (+ Notes)": calc_dca(np.array(eval_tf_late['y_prob'])),
+            "LSTM E2E FineTune (+ Notes)": calc_dca(np.array(eval_lstm_e2e['y_prob'])),
+            "Transformer E2E FineTune (+ Notes)": calc_dca(np.array(eval_tf_e2e['y_prob']))
         }
         dca_path = os.path.join(exp_dir, 'dca_results.json')
         with open(dca_path, 'w') as f:
@@ -416,6 +519,8 @@ def main():
             'LSTM LateFusion (+ Notes)': eval_notes,
             'Transformer EarlyFusion (+ Notes)': eval_tf,
             'Transformer LateFusion (+ Notes)': eval_tf_late,
+            'LSTM E2E FineTune (+ Notes)': eval_lstm_e2e,
+            'Transformer E2E FineTune (+ Notes)': eval_tf_e2e,
             'LSTM Base (w/o ICU)': eval_no_icu,
             'LSTM Base (w/o Adm)': eval_no_adm,
             'LSTM Base (w/o Codes)': eval_no_codes,
@@ -564,6 +669,8 @@ def main():
 {_note_row_agg('LSTM LateFusion (+ Notes)')}
 {_note_row_agg('Transformer EarlyFusion (+ Notes)')}
 {_note_row_agg('Transformer LateFusion (+ Notes)')}
+{_note_row_agg('LSTM E2E FineTune (+ Notes)')}
+{_note_row_agg('Transformer E2E FineTune (+ Notes)')}
 {_note_row_agg('LSTM Base (w/o ICU)')}
 {_note_row_agg('LSTM Base (w/o Adm)')}
 {_note_row_agg('LSTM Base (w/o Codes)')}
@@ -581,6 +688,8 @@ def main():
 {_note_row_05_agg('LSTM LateFusion (+ Notes)')}
 {_note_row_05_agg('Transformer EarlyFusion (+ Notes)')}
 {_note_row_05_agg('Transformer LateFusion (+ Notes)')}
+{_note_row_05_agg('LSTM E2E FineTune (+ Notes)')}
+{_note_row_05_agg('Transformer E2E FineTune (+ Notes)')}
 {_note_row_05_agg('LSTM Base (w/o ICU)')}
 {_note_row_05_agg('LSTM Base (w/o Adm)')}
 {_note_row_05_agg('LSTM Base (w/o Codes)')}
@@ -588,13 +697,13 @@ def main():
 {_note_row_05_agg('LSTM Base (Only Static & Codes)')}
 
 ## Clinical Utility (Decision Curve Analysis)
-| Threshold | XGB Base | XGB + Notes | LSTM Base | LSTM + Notes | TF EarlyFusion | TF LateFusion |
-|-----------|----------|-------------|-----------|--------------|----------------|---------------|
-| 0.10 | {_dca_agg('XGBoost Base', 0)} | {_dca_agg('XGBoost + LLM Notes', 0)} | {_dca_agg('LSTM Base', 0)} | {_dca_agg('LSTM LateFusion (+ Notes)', 0)} | {_dca_agg('Transformer EarlyFusion (+ Notes)', 0)} | {_dca_agg('Transformer LateFusion (+ Notes)', 0)} |
-| 0.20 | {_dca_agg('XGBoost Base', 1)} | {_dca_agg('XGBoost + LLM Notes', 1)} | {_dca_agg('LSTM Base', 1)} | {_dca_agg('LSTM LateFusion (+ Notes)', 1)} | {_dca_agg('Transformer EarlyFusion (+ Notes)', 1)} | {_dca_agg('Transformer LateFusion (+ Notes)', 1)} |
-| 0.30 | {_dca_agg('XGBoost Base', 2)} | {_dca_agg('XGBoost + LLM Notes', 2)} | {_dca_agg('LSTM Base', 2)} | {_dca_agg('LSTM LateFusion (+ Notes)', 2)} | {_dca_agg('Transformer EarlyFusion (+ Notes)', 2)} | {_dca_agg('Transformer LateFusion (+ Notes)', 2)} |
-| 0.40 | {_dca_agg('XGBoost Base', 3)} | {_dca_agg('XGBoost + LLM Notes', 3)} | {_dca_agg('LSTM Base', 3)} | {_dca_agg('LSTM LateFusion (+ Notes)', 3)} | {_dca_agg('Transformer EarlyFusion (+ Notes)', 3)} | {_dca_agg('Transformer LateFusion (+ Notes)', 3)} |
-| 0.50 | {_dca_agg('XGBoost Base', 4)} | {_dca_agg('XGBoost + LLM Notes', 4)} | {_dca_agg('LSTM Base', 4)} | {_dca_agg('LSTM LateFusion (+ Notes)', 4)} | {_dca_agg('Transformer EarlyFusion (+ Notes)', 4)} | {_dca_agg('Transformer LateFusion (+ Notes)', 4)} |
+| Threshold | XGB Base | XGB + Notes | LSTM Base | LSTM + Notes | TF EarlyFusion | TF LateFusion | LSTM E2E | TF E2E |
+|-----------|----------|-------------|-----------|--------------|----------------|---------------|----------|--------|
+| 0.10 | {_dca_agg('XGBoost Base', 0)} | {_dca_agg('XGBoost + LLM Notes', 0)} | {_dca_agg('LSTM Base', 0)} | {_dca_agg('LSTM LateFusion (+ Notes)', 0)} | {_dca_agg('Transformer EarlyFusion (+ Notes)', 0)} | {_dca_agg('Transformer LateFusion (+ Notes)', 0)} | {_dca_agg('LSTM E2E FineTune (+ Notes)', 0)} | {_dca_agg('Transformer E2E FineTune (+ Notes)', 0)} |
+| 0.20 | {_dca_agg('XGBoost Base', 1)} | {_dca_agg('XGBoost + LLM Notes', 1)} | {_dca_agg('LSTM Base', 1)} | {_dca_agg('LSTM LateFusion (+ Notes)', 1)} | {_dca_agg('Transformer EarlyFusion (+ Notes)', 1)} | {_dca_agg('Transformer LateFusion (+ Notes)', 1)} | {_dca_agg('LSTM E2E FineTune (+ Notes)', 1)} | {_dca_agg('Transformer E2E FineTune (+ Notes)', 1)} |
+| 0.30 | {_dca_agg('XGBoost Base', 2)} | {_dca_agg('XGBoost + LLM Notes', 2)} | {_dca_agg('LSTM Base', 2)} | {_dca_agg('LSTM LateFusion (+ Notes)', 2)} | {_dca_agg('Transformer EarlyFusion (+ Notes)', 2)} | {_dca_agg('Transformer LateFusion (+ Notes)', 2)} | {_dca_agg('LSTM E2E FineTune (+ Notes)', 2)} | {_dca_agg('Transformer E2E FineTune (+ Notes)', 2)} |
+| 0.40 | {_dca_agg('XGBoost Base', 3)} | {_dca_agg('XGBoost + LLM Notes', 3)} | {_dca_agg('LSTM Base', 3)} | {_dca_agg('LSTM LateFusion (+ Notes)', 3)} | {_dca_agg('Transformer EarlyFusion (+ Notes)', 3)} | {_dca_agg('Transformer LateFusion (+ Notes)', 3)} | {_dca_agg('LSTM E2E FineTune (+ Notes)', 3)} | {_dca_agg('Transformer E2E FineTune (+ Notes)', 3)} |
+| 0.50 | {_dca_agg('XGBoost Base', 4)} | {_dca_agg('XGBoost + LLM Notes', 4)} | {_dca_agg('LSTM Base', 4)} | {_dca_agg('LSTM LateFusion (+ Notes)', 4)} | {_dca_agg('Transformer EarlyFusion (+ Notes)', 4)} | {_dca_agg('Transformer LateFusion (+ Notes)', 4)} | {_dca_agg('LSTM E2E FineTune (+ Notes)', 4)} | {_dca_agg('Transformer E2E FineTune (+ Notes)', 4)} |
 
 ## Sensor Dropout Robustness (LSTM LateFusion)
 | Drop Rate | Threshold | AUROC | PRAUC | Precision | Recall | F1 |
@@ -610,6 +719,8 @@ def main():
 | `model_lstm_notes.pt`  | Late Fusion LSTM state_dict |
 | `model_tf_notes.pt`    | Early Fusion Transformer state_dict |
 | `model_tf_late.pt`     | Late Fusion Transformer state_dict |
+| `model_lstm_e2e.pt`    | LSTM E2E FineTune (+ Notes) state_dict |
+| `model_tf_e2e.pt`      | Transformer E2E FineTune (+ Notes) state_dict |
 | `model_xgb_base.json`  | XGBoost Base (XGBoost native format) |
 | `model_xgb_notes.json` | XGBoost + Notes (XGBoost native format) |
 | `model_lgb_base.txt`   | LightGBM Base |

@@ -149,12 +149,62 @@ def compute_icu_load_features(stays_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def load_note_texts(note_summary_dict):
+    """Build a stay_id -> note text mapping from the Llama summary cache."""
+    note_texts = {}
+    if not note_summary_dict:
+        return note_texts
+
+    for stay_id, payload in note_summary_dict.items():
+        parts = []
+        try:
+            sid = int(stay_id)
+        except (TypeError, ValueError):
+            sid = stay_id
+
+        if isinstance(payload, dict):
+            meta = payload.get('meta_summary', {}) if isinstance(payload.get('meta_summary', {}), dict) else {}
+            if isinstance(meta, dict):
+                final_summary = meta.get('final_summary')
+                if final_summary:
+                    parts.append(str(final_summary).strip())
+                risk_score = meta.get('readmission_risk_score')
+                if risk_score not in (None, ''):
+                    parts.append(f"Risk score: {risk_score}")
+                critical_factors = meta.get('critical_factors_list', [])
+                if isinstance(critical_factors, list) and critical_factors:
+                    parts.append("Critical factors: " + "; ".join(str(x) for x in critical_factors if str(x).strip()))
+                elif critical_factors:
+                    parts.append(f"Critical factors: {critical_factors}")
+
+            category_summaries = payload.get('category_summaries', {})
+            if isinstance(category_summaries, dict):
+                for category, summary in category_summaries.items():
+                    if isinstance(summary, str) and summary.strip():
+                        parts.append(f"{category}: {summary.strip()}")
+                    elif isinstance(summary, dict):
+                        text = summary.get('summary') or summary.get('content') or summary.get('text')
+                        if text:
+                            parts.append(f"{category}: {str(text).strip()}")
+            raw_summary = payload.get('summary')
+            if raw_summary and str(raw_summary).strip():
+                parts.append(str(raw_summary).strip())
+        elif isinstance(payload, str):
+            parts.append(payload.strip())
+
+        combined = " ".join(part for part in parts if str(part).strip())
+        note_texts[sid] = combined.strip()
+
+    return note_texts
+
+
 def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     logging.info("Connecting to DuckDB and loading MIMIC-III features...")
     con = duckdb.connect()
     
     stay_ids = list(embeddings_dict.keys())
-    if not stay_ids: return None, None, None, None, None, None
+    if not stay_ids:
+        return None, None, None, None, None, None, None, None
         
     # 1. Stays and Demographics
     logging.info("Loading Demographics...")
@@ -269,14 +319,13 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     logging.info("Formatting dataset...")
     X_seq, X_static, X_mh, X_note, Y = [], [], [], [], []
     
+    X_note_texts = []
     for _, stay in stays_df.iterrows():
         sid = stay['stay_id']
         hadm = stay['HADM_ID']
         
         # Sequence
         evs = events_df[events_df['stay_id'] == sid].copy()
-        # Bug3 fix: initialize with NaN so that un-observed slots are truly missing,
-        # and real zero-valued measurements are NOT incorrectly treated as absent.
         seq = np.full((48, 8), np.nan, dtype=np.float32)
         if not evs.empty:
             evs['CHARTTIME'] = pd.to_datetime(evs['CHARTTIME'])
@@ -285,14 +334,11 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
             for _, e in evs.iterrows():
                 seq[int(e['hour']), item_map[e['ITEMID']]] = e['VALUENUM']
 
-        # ffill: carry last observed value forward; fill remaining leading NaNs with 0
         df_seq = pd.DataFrame(seq).ffill().fillna(0.0)
         X_seq.append(df_seq.values)
         
-        # Static
         X_static.append([stay[col] for col in cont_cols + cat_cols])
         
-        # Multihot
         mh_vecs = []
         mh_vecs.append(icd_dict.get(hadm, np.zeros(icd_dim, dtype=np.float32)))
         mh_vecs.append(drg_dict.get(hadm, np.zeros(drg_dim, dtype=np.float32)))
@@ -306,10 +352,15 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
         elif isinstance(val, dict):
             val = val.get('embedding', np.zeros(note_emb_dim, dtype=np.float32))
         X_note.append(np.array(val, dtype=np.float32))
+
+        note_text = load_note_texts({sid: embeddings_dict.get(sid, {})}).get(sid, '')
+        if not note_text and isinstance(embeddings_dict.get(sid), dict):
+            note_text = str(embeddings_dict[sid].get('summary', '') or '')
+        X_note_texts.append(note_text)
         
         Y.append(stay['readmitted'])
         
-    return np.array(X_seq), np.array(X_static, dtype=np.float32), np.array(X_mh, dtype=np.float32), np.array(X_note), np.array(Y), static_dims, multihot_dims
+    return np.array(X_seq), np.array(X_static, dtype=np.float32), np.array(X_mh, dtype=np.float32), np.array(X_note), np.array(Y), static_dims, multihot_dims, X_note_texts
 
 def flatten_features(X_seq, X_static, X_mh):
     return np.concatenate([np.mean(X_seq, axis=1), X_seq[:, -1, :], X_static, X_mh], axis=1)
