@@ -294,10 +294,30 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
     stays_df['drg_code'] = stays_df['drg_code'].apply(
         lambda x: x if (x == 'UNKNOWN' or x in top_drg_set) else 'OTHER'
     )
+
+    # Option B: Extract Primary Diagnosis (SEQ_NUM=1) for single categorical nn.Embedding
+    logging.info("Loading primary diagnosis ICD (SEQ_NUM=1) per admission...")
+    primary_icd_df = con.query(f"""
+        SELECT HADM_ID, SUBSTRING(CAST(ICD9_CODE AS VARCHAR), 1, 3) as primary_icd
+        FROM read_csv_auto('/home/hanwen/data/mimic/iii/DIAGNOSES_ICD.csv', sample_size=-1)
+        WHERE HADM_ID IN {hadm_ids_tuple} AND SEQ_NUM = 1 AND ICD9_CODE IS NOT NULL
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY HADM_ID ORDER BY ROW_ID) = 1
+    """).df()
+    stays_df = stays_df.merge(primary_icd_df, on='HADM_ID', how='left')
+    stays_df['primary_icd'] = stays_df['primary_icd'].fillna('UNKNOWN').astype(str)
+    top_icd_set = set(
+        stays_df[stays_df['primary_icd'] != 'UNKNOWN']['primary_icd']
+        .value_counts()
+        .nlargest(128)
+        .index
+    )
+    stays_df['primary_icd'] = stays_df['primary_icd'].apply(
+        lambda x: x if (x == 'UNKNOWN' or x in top_icd_set) else 'OTHER'
+    )
     
     cont_cols = ['age', 'pre_icu_transfers', 'surg_count', 'log_surg_gap', 'log_ed_wait',
                  'icu_speedup_los', 'log_icu_los']
-    cat_cols = ['GENDER', 'MARITAL_STATUS', 'ETHNICITY', 'INSURANCE', 'ADMISSION_TYPE', 'ADMISSION_LOCATION', 'FIRST_CAREUNIT', 'surg_flag', 'drg_code']
+    cat_cols = ['GENDER', 'MARITAL_STATUS', 'ETHNICITY', 'INSURANCE', 'ADMISSION_TYPE', 'ADMISSION_LOCATION', 'FIRST_CAREUNIT', 'surg_flag', 'drg_code', 'primary_icd']
     
     static_encoders, static_dims = {}, {}
     for col in cont_cols:
@@ -310,8 +330,28 @@ def fetch_mimic3_data(embeddings_dict, note_emb_dim=768):
         static_dims[col] = len(le.classes_)
 
     # 2. Extract High-Dim Sparse Features (Multi-hot without DRG)
-    logging.info("Loading ICD Diagnoses (Top 64)...")
-    icd_dict, icd_dim = build_multihot_features(con, 'DIAGNOSES_ICD', 'HADM_ID', 'ICD9_CODE', hadm_ids_tuple, top_k=64, trim=3)
+    # Secondary Comorbidities (SEQ_NUM > 1, Top 32)
+    logging.info("Loading Secondary Comorbidities ICD (SEQ_NUM > 1, Top 32)...")
+    comorb_vocab_df = con.query(f"""
+        SELECT SUBSTRING(CAST(ICD9_CODE AS VARCHAR), 1, 3) as code, count(*) as cnt
+        FROM read_csv_auto('/home/hanwen/data/mimic/iii/DIAGNOSES_ICD.csv', sample_size=-1)
+        WHERE HADM_ID IN {hadm_ids_tuple} AND SEQ_NUM > 1 AND ICD9_CODE IS NOT NULL
+        GROUP BY code ORDER BY cnt DESC LIMIT 32
+    """).df()
+    comorb_vocab = comorb_vocab_df['code'].tolist()
+    comorb_raw_df = con.query(f"""
+        SELECT HADM_ID as target_id, SUBSTRING(CAST(ICD9_CODE AS VARCHAR), 1, 3) as code
+        FROM read_csv_auto('/home/hanwen/data/mimic/iii/DIAGNOSES_ICD.csv', sample_size=-1)
+        WHERE HADM_ID IN {hadm_ids_tuple} AND SEQ_NUM > 1 AND SUBSTRING(CAST(ICD9_CODE AS VARCHAR), 1, 3) IN {tuple(comorb_vocab)}
+    """).df()
+    icd_dict = {}
+    for tid, group in comorb_raw_df.groupby('target_id'):
+        vec = np.zeros(len(comorb_vocab), dtype=np.float32)
+        for code_val in group['code']:
+            if code_val in comorb_vocab:
+                vec[comorb_vocab.index(code_val)] = 1.0
+        icd_dict[tid] = vec
+    icd_dim = len(comorb_vocab)
     
     logging.info("Loading Procedures ICD (Top 64)...")
     proc_dict, proc_dim = build_multihot_features(con, 'PROCEDURES_ICD', 'HADM_ID', 'ICD9_CODE', hadm_ids_tuple, top_k=64, trim=3)
