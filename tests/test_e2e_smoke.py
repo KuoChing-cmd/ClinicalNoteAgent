@@ -58,3 +58,27 @@ def test_e2e_models_run_forward_pass():
     model_tf = TransformerEndToEndWithNotes(seq_dim=8, static_dims={"age": 0, "gender": 2, "unit": 3}, multihot_dims={'icd': 64}, note_dim=768, hidden_dim=16, num_layers=1, nhead=4, dropout=0.0)
     out_tf = model_tf(seq, static, mh, x_note_tokens=tok)
     assert out_tf.shape == (2,)
+
+
+def test_fusion_models_with_variable_multihot_dims():
+    from scripts.training.models import TransformerLateFusionWithNotes, TransformerEarlyFusionWithNotes, LSTMLateFusionWithNotes
+
+    B = 2
+    seq = torch.randn(B, 24, 8)
+    static = torch.tensor([[0, 1, 2], [1, 0, 1]], dtype=torch.float32)
+    static_dims = {"age": 0, "gender": 2, "unit": 3}
+    multihot_dims = {'icd': 32, 'proc': 64, 'rx': 64}
+    mh = torch.randn(B, 32 + 64 + 64)
+    note = torch.randn(B, 768)
+
+    model_tf_late = TransformerLateFusionWithNotes(seq_dim=8, static_dims=static_dims, multihot_dims=multihot_dims, note_dim=768, hidden_dim=16, num_layers=1, nhead=4, dropout=0.0)
+    out_tf_late = model_tf_late(seq, static, mh, note)
+    assert out_tf_late.shape == (B,)
+
+    model_tf_early = TransformerEarlyFusionWithNotes(seq_dim=8, static_dims=static_dims, multihot_dims=multihot_dims, note_dim=768, hidden_dim=16, num_layers=1, nhead=4, dropout=0.0)
+    out_tf_early = model_tf_early(seq, static, mh, note)
+    assert out_tf_early.shape == (B,)
+
+    model_lstm = LSTMLateFusionWithNotes(seq_dim=8, static_dims=static_dims, multihot_dims=multihot_dims, note_dim=768, hidden_dim=16, num_layers=1, dropout=0.0)
+    out_lstm = model_lstm(seq, static, mh, note)
+    assert out_lstm.shape == (B,)
