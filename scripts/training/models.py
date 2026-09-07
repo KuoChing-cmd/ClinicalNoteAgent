@@ -619,3 +619,130 @@ class TransformerEarlyFusionWithNotes(nn.Module):
         
         cls_out = out[:, 0, :]
         return self.classifier(cls_out).squeeze(-1)
+
+class TransformerEarlyFusionEndToEndWithNotes(TransformerEarlyFusionWithNotes):
+    def __init__(self, seq_dim, static_dims=None, multihot_dims=None, hidden_dim=64, note_dim=768, use_notes=True, num_layers=4, nhead=8, dropout=0.2,
+                 bert_model_name="emilyalsentzer/Bio_ClinicalBERT", freeze_layers=8, bert_lr_scale=0.1, static_mode="concat"):
+        super().__init__(seq_dim, static_dims=static_dims, multihot_dims=multihot_dims, hidden_dim=hidden_dim, note_dim=note_dim, use_notes=False, num_layers=num_layers, nhead=nhead, dropout=dropout, static_mode=static_mode)
+        self.use_notes = use_notes
+        self.bert_model_name = bert_model_name
+        self.freeze_layers = freeze_layers
+        self.bert_lr_scale = bert_lr_scale
+        self.max_seq_len = 512
+        
+        from transformers import AutoModel, AutoTokenizer, BertConfig, BertModel
+        self.bert_model, self.tokenizer = self._load_bert(bert_model_name)
+        self.bert_dim = getattr(self.bert_model.config, "hidden_size", note_dim)
+        
+        self.note_head = nn.Sequential(
+            nn.LayerNorm(self.bert_dim),
+            nn.Linear(self.bert_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+        )
+
+    def _load_bert(self, model_name):
+        from transformers import AutoModel, AutoTokenizer, BertConfig, BertModel
+        if AutoModel is None or AutoTokenizer is None:
+            config = BertConfig(vocab_size=30522, hidden_size=768, num_hidden_layers=2, num_attention_heads=8, intermediate_size=3072)
+            model = BertModel(config)
+            tokenizer = None
+            return model, tokenizer
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModel.from_pretrained(model_name)
+        except Exception:
+            config = BertConfig(vocab_size=30522, hidden_size=768, num_hidden_layers=2, num_attention_heads=8, intermediate_size=3072)
+            tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased") if AutoTokenizer is not None else None
+            model = BertModel(config)
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        bert_backbone = getattr(model, "encoder", getattr(model, "bert", model))
+        if hasattr(bert_backbone, "layer") and len(bert_backbone.layer) > self.freeze_layers:
+            for layer in bert_backbone.layer[:self.freeze_layers]:
+                for param in layer.parameters():
+                    param.requires_grad = False
+        return model, tokenizer
+
+    def _encode_note_tokens(self, x_note_tokens):
+        if x_note_tokens is None:
+            return None
+        from collections.abc import Mapping
+        import torch.nn.functional as F
+        if isinstance(x_note_tokens, Mapping):
+            input_ids = x_note_tokens.get("input_ids")
+            attention_mask = x_note_tokens.get("attention_mask")
+            if input_ids is None:
+                return None
+            outputs = self.bert_model(input_ids=input_ids, attention_mask=attention_mask)
+            cls = outputs.last_hidden_state[:, 0, :]
+        else:
+            cls = x_note_tokens
+        cls = F.normalize(cls, p=2, dim=1)
+        return self.note_head(cls)
+
+    def forward(self, x_seq, x_static=None, x_mh=None, x_note=None, x_note_tokens=None):
+        import torch
+        import torch.nn.functional as F
+        B = x_seq.shape[0]
+        x = self.seq_proj(x_seq) # [B, T, H]
+        extra_tokens = []
+        
+        if self.has_static and x_static is not None:
+            if self.static_mode == "multi_token":
+                static_tokens = []
+                col_idx = 0
+                for name, vocab_size in self.static_dims.items():
+                    val = x_static[:, col_idx]
+                    if vocab_size <= 0:
+                        token = self.static_heads[name](val.unsqueeze(1).float())
+                    else:
+                        token = self.static_heads[name](val.long())
+                    static_tokens.append(token.unsqueeze(1))
+                    col_idx += 1
+                extra_tokens.extend(static_tokens)
+            else:
+                static_embs = []
+                col_idx = 0
+                for name, _ in self.static_dims.items():
+                    val = x_static[:, col_idx]
+                    if self.static_dims[name] == 0:
+                        static_embs.append(val.unsqueeze(1).float())
+                    else:
+                        static_embs.append(self.emb_dict[name](val.long()))
+                    col_idx += 1
+                static_repr = self.static_head(torch.cat(static_embs, dim=1))
+                extra_tokens.append(static_repr.unsqueeze(1))
+                
+        if self.has_multihot and x_mh is not None:
+            mh_embs = []
+            col_offset = 0
+            for name, vocab_size in self.multihot_dims.items():
+                group = x_mh[:, col_offset : col_offset + vocab_size]
+                mh_embs.append(self._multihot_to_embedding(group, self.mh_emb_dict[name]))
+                col_offset += vocab_size
+            mh_repr = self.mh_head(torch.cat(mh_embs, dim=1))
+            extra_tokens.append(mh_repr.unsqueeze(1))
+            
+        if self.use_notes:
+            if x_note_tokens is not None:
+                note_repr = self._encode_note_tokens(x_note_tokens)
+            elif x_note is not None:
+                x_note_norm = F.normalize(x_note, p=2, dim=1)
+                note_repr = self.note_head(x_note_norm)
+            else:
+                note_repr = None
+            if note_repr is not None:
+                extra_tokens.append(note_repr.unsqueeze(1))
+                
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        if len(extra_tokens) > 0:
+            extra_tokens_tensor = torch.cat(extra_tokens, dim=1)
+            x = torch.cat((cls_tokens, extra_tokens_tensor, x), dim=1)
+        else:
+            x = torch.cat((cls_tokens, x), dim=1)
+            
+        x = self.pos_encoder(x)
+        out = self.transformer_encoder(x)
+        cls_out = out[:, 0, :]
+        return self.classifier(cls_out).squeeze(-1)
